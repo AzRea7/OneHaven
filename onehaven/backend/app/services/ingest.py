@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..models import Property, Lead, LeadSource, Strategy
 from .entity_resolution import canonicalize_address
 from .normalize import normalize_property_type, is_allowed_type
-from .outbox import enqueue_event
+from ..integrations.services.outbox import enqueue_event
 
 
 async def upsert_property(session: AsyncSession, payload: dict) -> Property | None:

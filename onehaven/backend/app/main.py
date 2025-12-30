@@ -13,7 +13,7 @@ from .services.outcomes import add_outcome_event, update_lead_status
 from .services.metrics import conversion_by_bucket, time_to_contact_by_bucket, roi_vs_realized
 
 from .services.refresh import refresh_region
-from .jobs.dispatch import run_dispatch
+from .integrations.jobs.dispatch import run_dispatch
 
 app = FastAPI(title="Haven v2 - Lead Truth Engine")
 

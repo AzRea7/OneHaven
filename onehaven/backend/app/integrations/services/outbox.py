@@ -7,8 +7,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import OutboxEvent, OutboxStatus, Integration, IntegrationType
-from ..integrations.webhook import WebhookSink
+from ...models import OutboxEvent, OutboxStatus, Integration, IntegrationType
+from ..webhook import WebhookSink
 
 
 async def enqueue_event(session: AsyncSession, event_type: str, payload: dict[str, Any]) -> OutboxEvent:
