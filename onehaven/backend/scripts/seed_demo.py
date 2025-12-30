@@ -9,7 +9,7 @@ async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    async with AsyncSessionLocal() as session:  # type: AsyncSession
+    async with AsyncSessionLocal() as session:  
         p = Property(
             address_line="123 DEMO ST",
             city="BIRMINGHAM",

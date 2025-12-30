@@ -7,7 +7,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..models import Property, Lead, LeadSource, Strategy
 from .entity_resolution import canonicalize_address
 from .normalize import normalize_property_type, is_allowed_type
-from ..integrations.services.outbox import enqueue_event
+from .outbox import enqueue_event
+
+from ..scoring.deal import estimate_arv, estimate_rehab, estimate_rent, deal_score
+from ..scoring.motivation import MotivationSignals, motivation_score
+from ..scoring.ranker import rank_score, explain
+from .features import years_since, equity_proxy, vacancy_proxy
+
+
+def _num(x):
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None
 
 
 async def upsert_property(session: AsyncSession, payload: dict) -> Property | None:
@@ -29,7 +41,7 @@ async def upsert_property(session: AsyncSession, payload: dict) -> Property | No
     )
     existing = (await session.execute(stmt)).scalars().first()
 
-    raw_type = payload.get("propertyType") or payload.get("property_type")
+    raw_type = payload.get("propertyType") or payload.get("property_type") or payload.get("PropertyType")
     norm_type = normalize_property_type(raw_type)
 
     if norm_type and not is_allowed_type(norm_type):
@@ -37,9 +49,9 @@ async def upsert_property(session: AsyncSession, payload: dict) -> Property | No
 
     if existing:
         existing.property_type = existing.property_type or norm_type
-        existing.beds = existing.beds or payload.get("bedrooms") or payload.get("beds")
-        existing.baths = existing.baths or payload.get("bathrooms") or payload.get("baths")
-        existing.sqft = existing.sqft or payload.get("squareFeet") or payload.get("sqft")
+        existing.beds = existing.beds or payload.get("bedrooms") or payload.get("beds") or payload.get("BedroomsTotal")
+        existing.baths = existing.baths or payload.get("bathrooms") or payload.get("baths") or payload.get("BathroomsTotal")
+        existing.sqft = existing.sqft or payload.get("squareFeet") or payload.get("sqft") or payload.get("LivingArea")
         return existing
 
     p = Property(
@@ -48,9 +60,11 @@ async def upsert_property(session: AsyncSession, payload: dict) -> Property | No
         state=canon.state,
         zipcode=canon.zipcode,
         property_type=norm_type,
-        beds=payload.get("bedrooms") or payload.get("beds"),
-        baths=payload.get("bathrooms") or payload.get("baths"),
-        sqft=payload.get("squareFeet") or payload.get("sqft"),
+        beds=payload.get("bedrooms") or payload.get("beds") or payload.get("BedroomsTotal"),
+        baths=payload.get("bathrooms") or payload.get("baths") or payload.get("BathroomsTotal"),
+        sqft=payload.get("squareFeet") or payload.get("sqft") or payload.get("LivingArea"),
+        lat=_num(payload.get("lat") or payload.get("Latitude")),
+        lon=_num(payload.get("lon") or payload.get("Longitude")),
     )
     session.add(p)
     await session.flush()
@@ -64,7 +78,10 @@ async def create_or_update_lead(
     strategy: Strategy,
     source_ref: str | None,
     provenance: dict,
-) -> Lead:
+) -> tuple[Lead, bool]:
+    """
+    Returns (lead, created_bool)
+    """
     stmt = select(Lead).where(
         Lead.property_id == property_id,
         Lead.source == source,
@@ -88,7 +105,7 @@ async def create_or_update_lead(
                 "updated_at": lead.updated_at.isoformat(),
             },
         )
-        return lead
+        return lead, False
 
     lead = Lead(
         property_id=property_id,
@@ -113,4 +130,41 @@ async def create_or_update_lead(
             "created_at": lead.created_at.isoformat(),
         },
     )
-    return lead
+    return lead, True
+
+
+async def score_lead(session: AsyncSession, lead: Lead, prop: Property, is_auction: bool) -> None:
+    """
+    v0 scoring: deterministic heuristics with explainability.
+    Replace with LightGBM models later.
+    """
+    # prices
+    list_price = lead.list_price
+
+    # v0 estimates
+    lead.arv_estimate = estimate_arv(list_price)
+    lead.rehab_estimate = estimate_rehab(prop.sqft)
+    lead.rent_estimate = estimate_rent(prop.beds, prop.sqft)
+
+    # signals
+    absentee = vacancy_proxy(prop.owner_mailing, prop.address_line) >= 1.0
+    yrs_held = years_since(prop.last_sale_date)
+    equity = equity_proxy(lead.arv_estimate, list_price)
+
+    mot = motivation_score(
+        MotivationSignals(
+            is_auction=is_auction,
+            absentee=absentee,
+            years_held=yrs_held,
+            equity_frac=equity,
+        )
+    )
+    deal = deal_score(list_price, lead.arv_estimate, lead.rehab_estimate)
+
+    lead.motivation_score = float(mot)
+    lead.deal_score = float(deal)
+    lead.rank_score = float(rank_score(deal, mot, lead.strategy.value))
+    lead.explain = explain(deal, mot, is_auction=is_auction, absentee=absentee, equity=equity)
+
+    lead.updated_at = datetime.utcnow()
+    await session.flush()

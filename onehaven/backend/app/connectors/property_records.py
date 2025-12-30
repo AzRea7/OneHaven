@@ -1,13 +1,14 @@
 import httpx
 from ..config import settings
 
+
 class PropertyRecordsClient:
     """
     Minimal enrichment client. Returns dict you merge into your Property.
     """
     def __init__(self) -> None:
-        self.base = settings.RENTCAST_BASE_URL
-        self.key = settings.RENTCAST_API_KEY
+        self.base = settings.PROPERTY_RECORDS_BASE_URL
+        self.key = settings.PROPERTY_RECORDS_API_KEY
 
     async def enrich(self, address: str, city: str, state: str, zipcode: str) -> dict:
         if not self.key:
@@ -22,4 +23,5 @@ class PropertyRecordsClient:
             if r.status_code == 404:
                 return {}
             r.raise_for_status()
-            return r.json() if isinstance(r.json(), dict) else {}
+            js = r.json()
+            return js if isinstance(js, dict) else {}

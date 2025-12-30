@@ -1,13 +1,13 @@
 from collections import defaultdict
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..connectors.rentcast import RentCastConnector
 from ..connectors.wayne_auction import WayneAuctionConnector
 from ..models import LeadSource, Strategy
-from .ingest import upsert_property, create_or_update_lead, score_lead
+from ..services.ingest import upsert_property, create_or_update_lead, score_lead
 
 SE_MICHIGAN_ZIPS = ["48009", "48084", "48301", "48067", "48306", "48304", "48302", "48226", "48201"]
+
 
 async def refresh_region(session: AsyncSession, region: str) -> dict:
     drop_reasons = defaultdict(int)
@@ -30,9 +30,8 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
                 drop_reasons["invalid_or_disallowed_property"] += 1
                 continue
 
-            # capture list_price if present
-            list_price = raw.payload.get("price") or raw.payload.get("listPrice")
-            lead = await create_or_update_lead(
+            list_price = raw.payload.get("price") or raw.payload.get("listPrice") or raw.payload.get("ListPrice")
+            lead, is_created = await create_or_update_lead(
                 session=session,
                 property_id=prop.id,
                 source=LeadSource.rentcast_listing,
@@ -40,13 +39,17 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
                 source_ref=raw.source_ref,
                 provenance=raw.provenance,
             )
-            if list_price:
-                lead.list_price = float(list_price)
+            if list_price is not None:
+                try:
+                    lead.list_price = float(list_price)
+                except Exception:
+                    pass
 
             await score_lead(session, lead, prop, is_auction=False)
-            updated += 1
+            created += 1 if is_created else 0
+            updated += 0 if is_created else 1
 
-        # 2) Wayne auctions (v0 scraper returns none until implemented)
+        # 2) Wayne auctions (will start returning once implemented)
         auctions = await wayne.fetch_by_zip(zipcode=z, limit=200)
         for raw in auctions:
             prop = await upsert_property(session, raw.payload)
@@ -55,7 +58,7 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
                 drop_reasons["invalid_or_disallowed_property"] += 1
                 continue
 
-            lead = await create_or_update_lead(
+            lead, is_created = await create_or_update_lead(
                 session=session,
                 property_id=prop.id,
                 source=LeadSource.wayne_auction,
@@ -64,7 +67,8 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
                 provenance=raw.provenance,
             )
             await score_lead(session, lead, prop, is_auction=True)
-            updated += 1
+            created += 1 if is_created else 0
+            updated += 0 if is_created else 1
 
     return {
         "created_leads": created,
