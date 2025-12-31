@@ -1,10 +1,12 @@
 # app/main.py
+from __future__ import annotations
 import json
 from fastapi import FastAPI, Depends, Query, HTTPException, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func
 from collections import defaultdict
 import statistics
+from typing import Any
 
 
 from .config import settings
@@ -44,27 +46,36 @@ async def startup() -> None:
         await conn.run_sync(Base.metadata.create_all)
 
 
-@app.post("/jobs/refresh", response_model=JobResult, dependencies=[Depends(require_api_key)])
-async def run_refresh(
-    region: str = Query("se_michigan"),
-    zips: str | None = Query(default=None, description="Comma-separated zips, e.g. 48362,48363"),
-    max_price: float | None = Query(default=None, ge=0),
+@app.post("/jobs/refresh", dependencies=[Depends(require_api_key)])
+async def jobs_refresh(
+    region: str | None = Query(None, description="Named region, e.g. se_michigan"),
+    zips: str | None = Query(None, description="Comma-separated zip list, e.g. 48362,48363"),
+    city: str | None = Query(None, description="City name, e.g. 'lake orion' or 'clarkston'"),
+    max_price: float | None = Query(None, description="Optional listing price ceiling"),
+    per_zip_limit: int = Query(200, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
-) -> JobResult:
-    jr = await start_job(session, "refresh_api")
-    try:
-        zip_list = None
-        if zips:
-            zip_list = [z.strip() for z in zips.split(",") if z.strip()]
+) -> dict[str, Any]:
+    """
+    Refresh priority:
+      1) zips
+      2) city
+      3) region
+    """
+    zip_list: list[str] = []
+    if zips:
+        zip_list = [z.strip() for z in zips.split(",") if z.strip()]
 
-        result = await refresh_region(session, region, max_price=max_price, zips=zip_list)
-        await finish_job_success(session, jr, result)
-        await session.commit()
-        return JobResult(**result)
-    except Exception as e:
-        await finish_job_fail(session, jr, e)
-        await session.commit()
-        raise
+    result = await refresh_region(
+        session,
+        region=region,
+        zips=zip_list or None,
+        city=city,
+        max_price=max_price,
+        per_zip_limit=per_zip_limit,
+    )
+    await session.commit()
+    return result
+
 
 
 

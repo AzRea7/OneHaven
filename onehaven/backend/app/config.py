@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     SCHED_REFRESH_REGION: str = "se_michigan"
     SCHED_REFRESH_INTERVAL_MINUTES: int = 1440  # daily
     SCHED_DISPATCH_INTERVAL_MINUTES: int = 5
+    SCHED_DISPATCH_BATCH_SIZE: int = 50
+
 
     # Add these fields to your Settings class in app/config.py
 

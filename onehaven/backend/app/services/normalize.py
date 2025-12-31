@@ -70,6 +70,16 @@ def normalize_property_type(raw: object) -> str:
     return "unknown"
 
 
+def is_allowed_type(norm_type: str | None) -> bool:
+    """
+    True if normalized type is explicitly allowed by the engine.
+    This is used by ingest.py and tests.
+    """
+    if not norm_type:
+        return False
+    return norm_type in ALLOWED_NORM_TYPES
+
+
 def is_disallowed_type(raw: object) -> tuple[bool, str, str]:
     """
     Returns: (is_disallowed, normalized_type, reason_key)
@@ -80,7 +90,7 @@ def is_disallowed_type(raw: object) -> tuple[bool, str, str]:
     if norm in DISALLOWED_NORM_TYPES:
         return True, norm, f"norm_type::{norm}"
 
-    if norm not in ALLOWED_NORM_TYPES:
+    if not is_allowed_type(norm):
         return True, norm, f"norm_type::{norm}"
 
     return False, norm, ""
