@@ -1,7 +1,19 @@
+# app/models.py
+from __future__ import annotations
+
 import enum
 from datetime import datetime
 
-from sqlalchemy import String, Column, Integer, Float, DateTime, Text, Enum, UniqueConstraint, Boolean
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    Float,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -42,9 +54,7 @@ class IntegrationType(str, enum.Enum):
 
 class Property(Base):
     __tablename__ = "properties"
-    __table_args__ = (
-        UniqueConstraint("address_line", "city", "state", "zipcode", name="uq_property_addr"),
-    )
+    __table_args__ = (UniqueConstraint("address_line", "city", "state", "zipcode", name="uq_property_addr"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     address_line: Mapped[str] = mapped_column(String(255))
@@ -98,12 +108,13 @@ class Lead(Base):
 
 class Integration(Base):
     """
-    Stores integration destinations. Keep it generic.
+    Stores integration destinations (sinks).
     Example:
       type=webhook
-      config_json={"url": "...", "secret": "...", "events":["lead.upserted"]}
+      config_json={"url":"...","secret":"..."}
     """
     __tablename__ = "integrations"
+    __table_args__ = (UniqueConstraint("name", name="uq_integration_name"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
@@ -111,20 +122,18 @@ class Integration(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
     config_json: Mapped[str] = mapped_column(Text, default="{}")
-
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class OutboxEvent(Base):
     """
-    Outbox pattern: events are written transactionally with lead updates,
-    then dispatched asynchronously. This gives reliable delivery + retry.
+    Outbox pattern: events written transactionally, dispatched async.
     """
     __tablename__ = "outbox_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    event_type: Mapped[str] = mapped_column(String(80), index=True)  # e.g. lead.upserted
+    event_type: Mapped[str] = mapped_column(String(80), index=True)  # e.g. lead.created
     payload_json: Mapped[str] = mapped_column(Text)
 
     status: Mapped[OutboxStatus] = mapped_column(Enum(OutboxStatus), default=OutboxStatus.pending)
@@ -147,11 +156,6 @@ class OutcomeType(str, enum.Enum):
 
 
 class OutcomeEvent(Base):
-    """
-    Outcome events are the training signal source.
-    Some are human pipeline events (contacted/responded),
-    some are market events (mls_pending/mls_closed).
-    """
     __tablename__ = "outcome_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -160,37 +164,23 @@ class OutcomeEvent(Base):
 
     occurred_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    # Optional payload fields
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # For closed outcomes
     contract_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     realized_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    # Provenance: "manual", "mls_reso", "partner_csv", etc.
     source: Mapped[str] = mapped_column(String(60), default="manual")
-
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
 
 class JobRun(Base):
     __tablename__ = "job_runs"
-    id = Column(Integer, primary_key=True)
-    job_name = Column(String, nullable=False)           # refresh / dispatch
-    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    finished_at = Column(DateTime, nullable=True)
-    status = Column(String, nullable=False, default="running")  # running/success/fail
-    summary_json = Column(Text, nullable=True)
-    error = Column(Text, nullable=True)
-
-class Integration(Base):
-    __tablename__ = "integrations"
-    __table_args__ = (
-        UniqueConstraint("name", name="uq_integration_name"),
-    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(120))
-    type: Mapped[IntegrationType] = mapped_column(Enum(IntegrationType))
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    config_json: Mapped[str] = mapped_column(Text, default="{}")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    job_name: Mapped[str] = mapped_column(String(120), nullable=False)  # refresh / dispatch / etc.
+
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="running")  # running/success/fail
+    summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
