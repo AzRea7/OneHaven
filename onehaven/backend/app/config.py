@@ -33,5 +33,16 @@ class Settings(BaseSettings):
     SCHED_REFRESH_INTERVAL_MINUTES: int = 1440  # daily
     SCHED_DISPATCH_INTERVAL_MINUTES: int = 5
 
+    # Add these fields to your Settings class in app/config.py
+
+    WAYNE_HTTP_TIMEOUT_S: int = 30
+    WAYNE_HTTP_SLEEP_S: float = 0.25
+    WAYNE_USER_AGENT: str = "onehaven/1.0 (+local dev)"
+    WAYNE_VERIFY_SSL: bool = True
+
+    # Optional: if you have a custom CA bundle path (rare on Windows corp setups)
+    WAYNE_CA_BUNDLE: str | None = None
+
+
 
 settings = Settings()

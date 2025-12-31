@@ -1,64 +1,63 @@
+# backend/app/jobs/scheduler.py
+from __future__ import annotations
+
 import asyncio
 import logging
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 from ..config import settings
-from ..db import async_session
-from ..services.jobruns import start_job, finish_job_success, finish_job_fail
-from .refresh import refresh_region
-from ..integrations.jobs.dispatch import run_dispatch
+from ..db import async_session_maker
+from ..services.jobs import run_refresh_job, run_dispatch_job  
 
-log = logging.getLogger("onehaven.scheduler")
+log = logging.getLogger(__name__)
 
 
 async def _run_refresh() -> None:
-    async with async_session() as session:
-        jr = await start_job(session, "refresh")
-        try:
-            result = await refresh_region(session, settings.SCHED_REFRESH_REGION)
-            await finish_job_success(session, jr, result)
-            await session.commit()
-            log.info("refresh_done", extra={"result": result})
-        except Exception as e:
-            await finish_job_fail(session, jr, e)
-            await session.commit()
-            log.exception("refresh_failed")
-            # Do not re-raise, scheduler should keep running
+    async with async_session_maker() as session:
+        await run_refresh_job(session=session, region=settings.SCHED_REFRESH_REGION)
+        await session.commit()
 
 
 async def _run_dispatch() -> None:
-    async with async_session() as session:
-        jr = await start_job(session, "dispatch")
-        try:
-            result = await run_dispatch(session=session, batch_size=50)
-            await finish_job_success(session, jr, result)
-            await session.commit()
-            log.info("dispatch_done", extra={"result": result})
-        except Exception as e:
-            await finish_job_fail(session, jr, e)
-            await session.commit()
-            log.exception("dispatch_failed")
-            # Do not re-raise
+    async with async_session_maker() as session:
+        await run_dispatch_job(session=session, batch_size=settings.SCHED_DISPATCH_BATCH_SIZE)
+        await session.commit()
 
 
 def build_scheduler() -> AsyncIOScheduler:
-    sched = AsyncIOScheduler()
+    """
+    Must be created/started within an asyncio event loop.
+    """
+    scheduler = AsyncIOScheduler(timezone=str(getattr(settings, "TZ", "America/Detroit")))
 
-    sched.add_job(
-        lambda: asyncio.create_task(_run_refresh()),
-        "interval",
-        minutes=settings.SCHED_REFRESH_INTERVAL_MINUTES,
+    scheduler.add_job(
+        _run_refresh,
+        trigger=IntervalTrigger(minutes=settings.SCHED_REFRESH_INTERVAL_MINUTES),
         id="refresh",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
 
-    sched.add_job(
-        lambda: asyncio.create_task(_run_dispatch()),
-        "interval",
-        minutes=settings.SCHED_DISPATCH_INTERVAL_MINUTES,
+    scheduler.add_job(
+        _run_dispatch,
+        trigger=IntervalTrigger(minutes=settings.SCHED_DISPATCH_INTERVAL_MINUTES),
         id="dispatch",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
 
-    return sched
+    return scheduler
+
+
+async def run_forever() -> None:
+    scheduler = build_scheduler()
+    scheduler.start()
+    log.info("Scheduler started")
+
+    # Keep the loop alive
+    stop = asyncio.Event()
+    await stop.wait()

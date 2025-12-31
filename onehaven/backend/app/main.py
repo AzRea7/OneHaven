@@ -2,7 +2,10 @@
 import json
 from fastapi import FastAPI, Depends, Query, HTTPException, Header
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
+from collections import defaultdict
+import statistics
+
 
 from .config import settings
 from .db import get_session, engine
@@ -44,12 +47,17 @@ async def startup() -> None:
 @app.post("/jobs/refresh", response_model=JobResult, dependencies=[Depends(require_api_key)])
 async def run_refresh(
     region: str = Query("se_michigan"),
+    zips: str | None = Query(default=None, description="Comma-separated zips, e.g. 48362,48363"),
     max_price: float | None = Query(default=None, ge=0),
     session: AsyncSession = Depends(get_session),
 ) -> JobResult:
     jr = await start_job(session, "refresh_api")
     try:
-        result = await refresh_region(session, region, max_price=max_price)
+        zip_list = None
+        if zips:
+            zip_list = [z.strip() for z in zips.split(",") if z.strip()]
+
+        result = await refresh_region(session, region, max_price=max_price, zips=zip_list)
         await finish_job_success(session, jr, result)
         await session.commit()
         return JobResult(**result)
@@ -57,6 +65,7 @@ async def run_refresh(
         await finish_job_fail(session, jr, e)
         await session.commit()
         raise
+
 
 
 @app.post("/jobs/dispatch", response_model=DispatchResult, dependencies=[Depends(require_api_key)])
@@ -347,3 +356,75 @@ async def wayne_test(zip: str = Query(...), limit: int = Query(50, ge=1, le=200)
         "sample": [l.payload for l in leads[:3]],
         "snapshots_dir": "data/wayne_snapshots/",
     }
+
+@app.get("/debug/leads/stats", dependencies=[Depends(require_api_key)])
+async def debug_leads_stats(
+    zips: str | None = Query(default=None, description="Comma-separated zips filter"),
+    session: AsyncSession = Depends(get_session),
+):
+    zip_filter = None
+    if zips:
+        zip_filter = {z.strip() for z in zips.split(",") if z.strip()}
+
+    # counts by zip + min/max
+    stmt = (
+        select(
+            Property.zipcode,
+            func.count(Lead.id),
+            func.min(Lead.list_price),
+            func.max(Lead.list_price),
+        )
+        .select_from(Lead)
+        .join(Property, Property.id == Lead.property_id)
+        .group_by(Property.zipcode)
+    )
+    rows = (await session.execute(stmt)).all()
+
+    # list prices for median (only where price present)
+    stmt_prices = (
+        select(Property.zipcode, Lead.list_price)
+        .select_from(Lead)
+        .join(Property, Property.id == Lead.property_id)
+        .where(Lead.list_price.isnot(None))
+    )
+    if zip_filter:
+        stmt_prices = stmt_prices.where(Property.zipcode.in_(zip_filter))
+
+    price_rows = (await session.execute(stmt_prices)).all()
+    prices_by_zip: dict[str, list[float]] = defaultdict(list)
+    for z, p in price_rows:
+        if p is not None:
+            prices_by_zip[z].append(float(p))
+
+    # counts by source
+    stmt_src = (
+        select(Property.zipcode, Lead.source, func.count(Lead.id))
+        .select_from(Lead)
+        .join(Property, Property.id == Lead.property_id)
+        .group_by(Property.zipcode, Lead.source)
+    )
+    if zip_filter:
+        stmt_src = stmt_src.where(Property.zipcode.in_(zip_filter))
+    src_rows = (await session.execute(stmt_src)).all()
+    src_counts: dict[str, dict[str, int]] = defaultdict(dict)
+    for z, src, c in src_rows:
+        src_counts[z][src.value if hasattr(src, "value") else str(src)] = int(c)
+
+    out = []
+    for zipcode, cnt, minp, maxp in rows:
+        if zip_filter and zipcode not in zip_filter:
+            continue
+        arr = prices_by_zip.get(zipcode, [])
+        med = float(statistics.median(arr)) if arr else None
+        out.append(
+            {
+                "zip": zipcode,
+                "count": int(cnt),
+                "min_list_price": float(minp) if minp is not None else None,
+                "median_list_price": med,
+                "max_list_price": float(maxp) if maxp is not None else None,
+                "counts_by_source": src_counts.get(zipcode, {}),
+            }
+        )
+    out.sort(key=lambda x: x["zip"])
+    return out

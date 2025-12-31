@@ -1,3 +1,4 @@
+# onehaven/backend/app/connectors/wayne_auction.py
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +10,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin
 
+import certifi
 import httpx
 from bs4 import BeautifulSoup
 
@@ -44,6 +46,17 @@ def _sleep_polite() -> None:
 
 
 class WayneAuctionConnector:
+    """
+    Conservative connector:
+      - snapshots fetched HTML
+      - extracts batch ids, then property rows
+      - emits RawLead objects for the target zip
+
+    SSL strategy:
+      - default: verify SSL using certifi bundle
+      - dev-only escape hatch: WAYNE_VERIFY_SSL=0 (do not use in prod)
+    """
+
     def __init__(self) -> None:
         self.timeout = settings.WAYNE_HTTP_TIMEOUT_S
         self.snap_dir = os.path.join(os.getcwd(), "data", "wayne_snapshots")
@@ -54,6 +67,19 @@ class WayneAuctionConnector:
         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         return os.path.join(self.snap_dir, f"{ts}_{key}.html")
 
+    def _http_verify(self) -> bool | str:
+        """
+        httpx 'verify' can be:
+          - True/False
+          - path to CA bundle
+        """
+        if not settings.WAYNE_VERIFY_SSL:
+            return False
+        # If user provides explicit CA bundle path, use it; else certifi.
+        if getattr(settings, "WAYNE_CA_BUNDLE", None):
+            return settings.WAYNE_CA_BUNDLE
+        return certifi.where()
+
     async def _fetch_html(self, url: str) -> str:
         self.health.fetched += 1
         _sleep_polite()
@@ -62,7 +88,13 @@ class WayneAuctionConnector:
             "User-Agent": settings.WAYNE_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, headers=headers) as client:
+
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            follow_redirects=True,
+            headers=headers,
+            verify=self._http_verify(),
+        ) as client:
             r = await client.get(url)
             r.raise_for_status()
             html = r.text
@@ -75,6 +107,7 @@ class WayneAuctionConnector:
     def _parse_batch_ids(self, html: str) -> list[str]:
         soup = BeautifulSoup(html, "lxml")
         batch_ids: list[str] = []
+
         for tr in soup.select("tr"):
             tds = tr.find_all("td")
             if not tds:
@@ -83,7 +116,9 @@ class WayneAuctionConnector:
             if first and re.fullmatch(r"\d{1,6}", first):
                 batch_ids.append(first)
 
-        out, seen = [], set()
+        # de-dupe keep order
+        out: list[str] = []
+        seen: set[str] = set()
         for b in batch_ids:
             if b not in seen:
                 out.append(b)
@@ -126,11 +161,17 @@ class WayneAuctionConnector:
         return props
 
     async def fetch_by_zip(self, zipcode: str, limit: int = 200) -> list[RawLead]:
+        """
+        Return auction leads for a single zip.
+        Payload intentionally minimal; enrichment comes later.
+        """
         try:
             batches_html = await self._fetch_html(BATCHES_URL)
             batch_ids = self._parse_batch_ids(batches_html)
 
             leads: list[RawLead] = []
+
+            # keep bounded; auctions pages can be big
             for bid in batch_ids[:25]:
                 props_html = await self._fetch_html(f"{PROPS_URL}?batchId={bid}")
                 rows = self._parse_property_rows(props_html)
@@ -141,7 +182,9 @@ class WayneAuctionConnector:
 
                     payload = {
                         "addressLine": r["address_line"],
-                        "city": "DETROIT",  # fallback until you enrich
+                        # TODO: if you later parse details page, you can set actual city.
+                        # For now, we keep a safe fallback.
+                        "city": "DETROIT",
                         "state": "MI",
                         "zipCode": zipcode,
                         "propertyType": "single_family",
@@ -160,6 +203,7 @@ class WayneAuctionConnector:
                             },
                         )
                     )
+
                     if len(leads) >= limit:
                         break
 
