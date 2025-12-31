@@ -28,9 +28,6 @@ def estimate_rent(beds: int | None, sqft: int | None) -> float | None:
 
 
 def _monthly_mortgage_payment(loan_amount: float, annual_rate: float = 0.07, years: int = 30) -> float:
-    """
-    Standard amortization payment.
-    """
     r = annual_rate / 12.0
     n = years * 12
     if r <= 0:
@@ -39,35 +36,21 @@ def _monthly_mortgage_payment(loan_amount: float, annual_rate: float = 0.07, yea
 
 
 def gross_yield(list_price: float | None, rent: float | None) -> float | None:
-    """
-    Annual gross rent / price, e.g. 0.08 = 8%
-    """
     if not list_price or not rent or list_price <= 0 or rent <= 0:
         return None
     return (rent * 12.0) / list_price
 
 
 def rental_sanity_score(list_price: float | None, rent: float | None) -> float:
-    """
-    Punish “rent doesn’t remotely match price”.
-    Uses rent-to-price (annualized) as a crude cap-rate proxy.
-    """
     gy = gross_yield(list_price, rent)
     if gy is None:
-        return 0.2  # unknown => small neutral (don’t zero out everything)
+        return 0.2  # unknown => small neutral
 
-    # Map: 1% => ~0, 6% => ~0.6, 10% => ~1 (rough)
     x = (gy - 0.01) / (0.10 - 0.01)
     return max(0.0, min(1.0, x))
 
 
 def dscr_proxy(list_price: float | None, rent: float | None) -> float | None:
-    """
-    Very rough DSCR proxy:
-    NOI ≈ rent * 0.65 (35% expense load)
-    Debt service based on 80% LTV @ 7% 30yr
-    DSCR = NOI / debt_service
-    """
     if not list_price or not rent or list_price <= 0 or rent <= 0:
         return None
     noi = rent * 0.65
@@ -82,18 +65,11 @@ def dscr_proxy_score(list_price: float | None, rent: float | None) -> float:
     dscr = dscr_proxy(list_price, rent)
     if dscr is None:
         return 0.2
-    # Map DSCR: 0.8 => 0, 1.0 => 0.4, 1.25 => 1.0
     x = (dscr - 0.8) / (1.25 - 0.8)
     return max(0.0, min(1.0, x))
 
 
 def coc_proxy(list_price: float | None, rent: float | None) -> float | None:
-    """
-    Rough cash-on-cash proxy:
-    Cash invested = 20% down + 3% closing
-    Cashflow ≈ NOI - debt
-    CoC annual = cashflow*12 / cash_invested
-    """
     if not list_price or not rent or list_price <= 0 or rent <= 0:
         return None
     noi = rent * 0.65
@@ -110,7 +86,6 @@ def coc_proxy_score(list_price: float | None, rent: float | None) -> float:
     coc = coc_proxy(list_price, rent)
     if coc is None:
         return 0.2
-    # Map: -5% => 0, 0% => 0.4, 8% => 1.0
     x = (coc + 0.05) / (0.08 + 0.05)
     return max(0.0, min(1.0, x))
 
@@ -169,4 +144,49 @@ def deal_score(
         v = rental_viability(list_price, rent)
         return max(0.0, min(1.0, base * v.viability_score))
 
-    return base
+    return base  # ✅ FIX: no trailing comma
+
+
+# -----------------------------
+# Compatibility wrapper
+# -----------------------------
+def score_deal(
+    *,
+    list_price: float | None,
+    beds: int | None,
+    baths: float | None,
+    sqft: int | None,
+    rent: float | None,
+    strategy: str,
+) -> tuple[float, dict]:
+    """
+    Convenience wrapper used by ingest/scoring pipelines.
+    Returns:
+      (deal_score_value, drivers_dict)
+    """
+    rehab = estimate_rehab(sqft)
+    arv = estimate_arv(list_price)
+
+    # if rent missing, estimate a crude fallback (but you'll gate/penalize later)
+    rent_used = rent if rent is not None else estimate_rent(beds=beds, sqft=sqft)
+
+    ds = deal_score(
+        list_price=list_price,
+        arv=arv,
+        rehab=rehab,
+        rent=rent_used,
+        strategy=strategy,
+    )
+
+    drivers = {
+        "arv": arv,
+        "rehab": rehab,
+        "rent_used": rent_used,
+        "gross_yield": gross_yield(list_price, rent_used),
+        "dscr_proxy": dscr_proxy(list_price, rent_used),
+        "coc_proxy": coc_proxy(list_price, rent_used),
+        "rent_sanity": rental_sanity_score(list_price, rent_used),
+        "price_to_arv": (list_price / arv) if (list_price and arv) else None,
+        "base_discount": ((arv - list_price) / arv) if (list_price and arv) else None,
+    }
+    return float(ds), drivers

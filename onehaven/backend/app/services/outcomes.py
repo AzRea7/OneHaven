@@ -1,29 +1,27 @@
-# onehaven/backend/app/services/outcomes.py
+# app/services/outcomes.py
 from __future__ import annotations
 
 from datetime import datetime
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..integrations.services.outbox import enqueue_event
 from ..models import Lead, LeadStatus, OutcomeEvent, OutcomeType
+from ..integrations.services.outbox import enqueue_event
 
-# Define the funnel order (monotonic progression)
+# funnel order for stage sanity
 _STAGE_ORDER: dict[OutcomeType, int] = {
     OutcomeType.contacted: 1,
     OutcomeType.responded: 2,
     OutcomeType.appointment_set: 3,
     OutcomeType.under_contract: 4,
     OutcomeType.closed: 5,
-    OutcomeType.dead: 99,  # terminal but not "success"
+    OutcomeType.dead: 99,
 }
 
 _TERMINAL: set[OutcomeType] = {OutcomeType.closed, OutcomeType.dead}
 
 
 def _implied_lead_status(outcome_type: OutcomeType) -> LeadStatus | None:
-    # Map outcome events -> operational statuses (simple + consistent)
     if outcome_type in (
         OutcomeType.contacted,
         OutcomeType.responded,
@@ -42,16 +40,13 @@ async def update_lead_status(
     session: AsyncSession,
     lead_id: int,
     status: LeadStatus,
-    occurred_at: datetime | None,
-    notes: str | None,
+    occurred_at: datetime | None = None,
+    notes: str | None = None,
     source: str = "manual",
-) -> Lead:
+) -> None:
     """
-    Explicit status transition endpoint helper.
-
-    This is separate from outcome events:
-    - outcomes represent "funnel facts" (contacted/responded/etc.)
-    - status represents your operational queue state (new/qualified/contacted/...)
+    Simple operational status update (queue workflow).
+    Also emits an outbox event so downstream systems can mirror your status.
     """
     lead = (await session.execute(select(Lead).where(Lead.id == lead_id))).scalars().first()
     if not lead:
@@ -61,7 +56,6 @@ async def update_lead_status(
     lead.updated_at = datetime.utcnow()
     await session.flush()
 
-    # Emit outbox event (webhooks / integrations)
     await enqueue_event(
         session,
         "lead.status_changed",
@@ -73,8 +67,6 @@ async def update_lead_status(
             "notes": notes,
         },
     )
-
-    return lead
 
 
 async def add_outcome_event(
@@ -104,14 +96,14 @@ async def add_outcome_event(
     existing_types = [e.outcome_type for e in existing]
     existing_terminal = next((t for t in existing_types if t in _TERMINAL), None)
 
-    # Terminal rule: once closed or dead, refuse conflicting terminal
+    # terminal consistency rule
     if existing_terminal and outcome_type in _TERMINAL and outcome_type != existing_terminal:
         raise ValueError(
             f"Lead {lead_id} already has terminal outcome '{existing_terminal.value}'. "
             f"Refusing to add conflicting terminal '{outcome_type.value}'."
         )
 
-    # Optional: warn if logging stage "backwards" vs max stage reached
+    # warn for backwards stage logging (non-fatal)
     max_stage = 0
     for t in existing_types:
         max_stage = max(max_stage, _STAGE_ORDER.get(t, 0))
@@ -133,14 +125,12 @@ async def add_outcome_event(
     session.add(ev)
     await session.flush()
 
-    # Update lead operational status (UI/queues)
     implied = _implied_lead_status(outcome_type)
     if implied is not None:
         lead.status = implied
         lead.updated_at = datetime.utcnow()
         await session.flush()
 
-    # Emit outbox event (integrations / webhooks)
     await enqueue_event(
         session,
         "lead.outcome",

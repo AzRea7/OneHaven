@@ -1,80 +1,67 @@
-# onehaven/backend/app/jobs/scheduler.py
+# app/jobs/scheduler.py
 from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from sqlalchemy import select, func
 
-from ..config import settings
-from ..db import async_session_maker
-from ..services.jobruns import start_job, finish_job_fail, finish_job_success
-from .refresh import refresh_region
-from ..integrations.services.outbox import dispatch_pending_events
+from ..db import async_session
+from ..models import Integration, OutboxEvent, OutboxStatus
+from ..jobs.refresh import run_refresh_job
+from ..integrations.jobs.dispatch import dispatch_outbox_once
 
 log = logging.getLogger(__name__)
 
 
 async def _run_refresh() -> None:
-    async with async_session_maker() as session:
-        jr = await start_job(session, "refresh_sched")
-
-        try:
-            region = getattr(settings, "SCHED_REFRESH_REGION", None)
-            max_price = getattr(settings, "SCHED_REFRESH_MAX_PRICE", None)
-
-            result = await refresh_region(session, region=region, max_price=max_price)
-            await session.commit()
-
-            await finish_job_success(session, jr, result)
-            await session.commit()
-
-        except Exception as e:
-            await session.rollback()
-            await finish_job_fail(session, jr, e)
-            await session.commit()
-            raise
+    async with async_session() as session:
+        # tweak defaults if you want
+        await run_refresh_job(session=session, zips=None, max_price=None)
+        await session.commit()
 
 
-async def _run_dispatch() -> None:
-    async with async_session_maker() as session:
-        jr = await start_job(session, "dispatch_sched")
+async def _run_dispatch_quiet() -> None:
+    """
+    Quiet-by-default posture:
+    - If there are no enabled integrations, do nothing.
+    - If there are no pending outbox events, do nothing.
+    """
+    async with async_session() as session:
+        enabled_sinks = (
+            await session.execute(select(func.count()).select_from(Integration).where(Integration.enabled == True))  # noqa: E712
+        ).scalar_one()
 
-        try:
-            result = await dispatch_pending_events(session)
-            await session.commit()
+        if int(enabled_sinks) == 0:
+            return  # ✅ QUIET
 
-            await finish_job_success(session, jr, result)
-            await session.commit()
+        pending = (
+            await session.execute(
+                select(func.count())
+                .select_from(OutboxEvent)
+                .where(OutboxEvent.status == OutboxStatus.pending)
+                .where(OutboxEvent.next_attempt_at <= datetime.utcnow())
+            )
+        ).scalar_one()
 
-        except Exception as e:
-            await session.rollback()
-            await finish_job_fail(session, jr, e)
-            await session.commit()
-            raise
+        if int(pending) == 0:
+            return  # ✅ QUIET
+
+    # do actual dispatch outside the count transaction
+    async with async_session() as session:
+        await dispatch_outbox_once(session=session)
+        await session.commit()
 
 
 def build_scheduler() -> AsyncIOScheduler:
-    sched = AsyncIOScheduler(timezone="America/Detroit")
+    sched = AsyncIOScheduler()
 
-    refresh_minutes = int(getattr(settings, "SCHED_REFRESH_INTERVAL_MINUTES", 1440))
-    dispatch_minutes = int(getattr(settings, "SCHED_DISPATCH_INTERVAL_MINUTES", 5))
+    # refresh cadence (example: every 60 minutes)
+    sched.add_job(lambda: asyncio.create_task(_run_refresh()), "interval", minutes=60)
 
-    sched.add_job(_run_refresh, "interval", minutes=refresh_minutes, id="_run_refresh", replace_existing=True)
-    sched.add_job(_run_dispatch, "interval", minutes=dispatch_minutes, id="_run_dispatch", replace_existing=True)
+    # dispatch cadence (every 5 minutes)
+    sched.add_job(lambda: asyncio.create_task(_run_dispatch_quiet()), "interval", minutes=5)
 
     return sched
-
-
-def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-
-    sched = build_scheduler()
-    sched.start()
-    log.info("Scheduler started")
-
-    asyncio.get_event_loop().run_forever()
-
-
-if __name__ == "__main__":
-    main()

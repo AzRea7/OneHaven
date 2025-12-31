@@ -1,209 +1,317 @@
-# app/services/ingest.py
+# backend/app/services/ingest.py
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..integrations.services.outbox import enqueue_event
-from ..models import Lead, LeadSource, Property, Strategy
-from ..scoring.deal import (
-    deal_score,
-    estimate_arv,
-    estimate_rehab,
-    estimate_rent,
-    rental_viability,
-)
-from ..scoring.motivation import MotivationSignals, motivation_score
-from ..scoring.ranker import explain, rank_score
-from .entity_resolution import canonicalize_address
-from .features import equity_proxy, vacancy_proxy, years_since
-from .normalize import is_allowed_type, normalize_property_type
+from ..models import Lead, LeadSource, LeadStatus, Property, Strategy
+from ..scoring.deal import estimate_arv, estimate_rehab, deal_score
+from ..scoring.ranker import rank_score, explain as explain_ranker
 
 
-def _num(x):
+def _to_int(x: Any) -> int | None:
+    if x is None or x == "":
+        return None
     try:
-        return float(x) if x is not None else None
+        return int(float(x))
     except Exception:
         return None
 
 
-async def upsert_property(session: AsyncSession, payload: dict) -> Property | None:
-    addr = payload.get("address") or payload.get("addressLine") or payload.get("street") or ""
-    city = payload.get("city") or ""
-    state = payload.get("state") or "MI"
-    zipcode = payload.get("zip") or payload.get("zipcode") or payload.get("zipCode") or ""
-
-    if not addr or not city or not zipcode:
+def _to_float(x: Any) -> float | None:
+    if x is None or x == "":
+        return None
+    try:
+        return float(x)
+    except Exception:
         return None
 
-    canon = canonicalize_address(addr, city, state, zipcode)
 
-    stmt = select(Property).where(
-        Property.address_line == canon.address_line,
-        Property.city == canon.city,
-        Property.state == canon.state,
-        Property.zipcode == canon.zipcode,
+def _get(payload: dict[str, Any], *keys: str) -> Any:
+    """Return first non-empty key from payload."""
+    for k in keys:
+        v = payload.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        return v
+    return None
+
+
+def _get_nested(payload: dict[str, Any], path: str) -> Any:
+    """
+    Tiny dot-path getter: "address.line1" or "address.city"
+    """
+    cur: Any = payload
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+        if cur is None:
+            return None
+    return cur
+
+
+def _normalize_address_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Take a connector payload and produce canonical address fields:
+      addressLine, city, stateCode, zipCode
+
+    Supports typical RentCast-ish keys and some nested variants.
+    """
+    # Try nested address blobs first if present
+    addr_line = _get(payload, "addressLine", "address", "streetAddress", "street")
+    if not addr_line:
+        addr_line = _get_nested(payload, "address.addressLine") or _get_nested(payload, "address.line") or _get_nested(payload, "address.line1")
+
+    city = _get(payload, "city")
+    if not city:
+        city = _get_nested(payload, "address.city")
+
+    state = _get(payload, "stateCode", "state", "province")
+    if not state:
+        state = _get_nested(payload, "address.state") or _get_nested(payload, "address.stateCode")
+
+    zipc = _get(payload, "zipCode", "zipcode", "postalCode")
+    if not zipc:
+        zipc = _get_nested(payload, "address.zip") or _get_nested(payload, "address.zipCode") or _get_nested(payload, "address.postalCode")
+
+    out = dict(payload)
+    if addr_line is not None:
+        out["addressLine"] = str(addr_line).strip()
+    if city is not None:
+        out["city"] = str(city).strip()
+    if state is not None:
+        # store canonical two-letter state if we can
+        out["stateCode"] = str(state).strip()
+    if zipc is not None:
+        out["zipCode"] = str(zipc).strip()
+
+    return out
+
+
+async def upsert_property(session: AsyncSession, payload: dict[str, Any]) -> Property:
+    """
+    Upsert property by address identity.
+    Required: addressLine, city, stateCode, zipCode (after normalization).
+    """
+    p = _normalize_address_fields(payload)
+
+    address_line = (p.get("addressLine") or "").strip()
+    city = (p.get("city") or "").strip()
+    state = (p.get("stateCode") or p.get("state") or "").strip()
+    zipcode = (p.get("zipCode") or "").strip()
+
+    if not (address_line and city and state and zipcode):
+        # IMPORTANT: include a tiny debug hint without dumping the entire payload
+        hint = {
+            "addressLine": bool(address_line),
+            "city": bool(city),
+            "state": bool(state),
+            "zipCode": bool(zipcode),
+            "keys": sorted(list(p.keys()))[:25],
+        }
+        raise ValueError(f"Missing required address fields for property upsert. hint={hint}")
+
+    # Optional enrich fields
+    lat = _to_float(_get(p, "latitude", "lat"))
+    lon = _to_float(_get(p, "longitude", "lon", "lng"))
+    beds = _to_int(_get(p, "bedrooms", "beds"))
+    baths = _to_float(_get(p, "bathrooms", "baths"))
+    sqft = _to_int(_get(p, "squareFootage", "sqft", "livingArea"))
+
+    raw_type = _get(p, "propertyType", "homeType", "type")
+    prop_type = str(raw_type).strip().lower() if raw_type is not None else None
+
+    # Find existing
+    q = select(Property).where(
+        Property.address_line == address_line,
+        Property.city == city,
+        Property.state == state,
+        Property.zipcode == zipcode,
     )
-    existing = (await session.execute(stmt)).scalars().first()
-
-    raw_type = payload.get("propertyType") or payload.get("property_type") or payload.get("PropertyType")
-    norm_type = normalize_property_type(raw_type)
-
-    if norm_type and not is_allowed_type(norm_type):
-        return None
+    existing = (await session.execute(q)).scalars().first()
 
     if existing:
-        existing.property_type = existing.property_type or norm_type
-        existing.beds = existing.beds or payload.get("bedrooms") or payload.get("beds") or payload.get("BedroomsTotal")
-        existing.baths = (
-            existing.baths or payload.get("bathrooms") or payload.get("baths") or payload.get("BathroomsTotal")
-        )
-        existing.sqft = existing.sqft or payload.get("squareFeet") or payload.get("sqft") or payload.get("LivingArea")
+        # update mutable attrs
+        existing.lat = lat if lat is not None else existing.lat
+        existing.lon = lon if lon is not None else existing.lon
+        existing.beds = beds if beds is not None else existing.beds
+        existing.baths = baths if baths is not None else existing.baths
+        existing.sqft = sqft if sqft is not None else existing.sqft
+        existing.property_type = prop_type if prop_type is not None else existing.property_type
+        await session.flush()
         return existing
 
-    p = Property(
-        address_line=canon.address_line,
-        city=canon.city,
-        state=canon.state,
-        zipcode=canon.zipcode,
-        property_type=norm_type,
-        beds=payload.get("bedrooms") or payload.get("beds") or payload.get("BedroomsTotal"),
-        baths=payload.get("bathrooms") or payload.get("baths") or payload.get("BathroomsTotal"),
-        sqft=payload.get("squareFeet") or payload.get("sqft") or payload.get("LivingArea"),
-        lat=_num(payload.get("lat") or payload.get("Latitude")),
-        lon=_num(payload.get("lon") or payload.get("Longitude")),
+    prop = Property(
+        address_line=address_line,
+        city=city,
+        state=state,
+        zipcode=zipcode,
+        lat=lat,
+        lon=lon,
+        beds=beds,
+        baths=baths,
+        sqft=sqft,
+        property_type=prop_type,
+        created_at=datetime.utcnow(),
     )
-    session.add(p)
-    await session.flush()
-    return p
+    session.add(prop)
+    await session.flush()  # assigns prop.id
+    return prop
 
 
 async def create_or_update_lead(
     session: AsyncSession,
-    property_id: int,
-    source: LeadSource,
+    *,
+    prop: Property,
     strategy: Strategy,
+    source: LeadSource,
     source_ref: str | None,
-    provenance: dict,
+    list_price: float | None,
+    rent_estimate: float | None,
+    provenance: dict[str, Any] | None = None,
 ) -> tuple[Lead, bool]:
-    stmt = select(Lead).where(
-        Lead.property_id == property_id,
-        Lead.source == source,
+    """
+    Upsert a lead by (property_id, strategy, source).
+    """
+    q = select(Lead).where(
+        Lead.property_id == prop.id,
         Lead.strategy == strategy,
+        Lead.source == source,
     )
-    lead = (await session.execute(stmt)).scalars().first()
-    now = datetime.utcnow()
+    existing = (await session.execute(q)).scalars().first()
 
-    if lead:
-        lead.updated_at = now
-        lead.provenance_json = json.dumps(provenance)
+    prov_json = None
+    if provenance is not None:
+        try:
+            prov_json = json.dumps(provenance)[:20000]  # cap for sqlite sanity
+        except Exception:
+            prov_json = None
 
-        await enqueue_event(
-            session,
-            "lead.upserted",
-            {
-                "lead_id": lead.id,
-                "property_id": property_id,
-                "source": source.value,
-                "strategy": strategy.value,
-                "updated_at": lead.updated_at.isoformat(),
-            },
-        )
-        return lead, False
+    if existing:
+        existing.source_ref = source_ref or existing.source_ref
+        existing.list_price = list_price if list_price is not None else existing.list_price
+        existing.rent_estimate = rent_estimate if rent_estimate is not None else existing.rent_estimate
+        existing.updated_at = datetime.utcnow()
+        if hasattr(existing, "score_json") and prov_json is not None:
+            existing.score_json = prov_json
+        await session.flush()
+        return existing, False
 
     lead = Lead(
-        property_id=property_id,
-        source=source,
+        property_id=prop.id,
         strategy=strategy,
+        source=source,
         source_ref=source_ref,
-        provenance_json=json.dumps(provenance),
-        created_at=now,
-        updated_at=now,
+        list_price=list_price,
+        rent_estimate=rent_estimate,
+        status=LeadStatus.new,
+        deal_score=0.0,
+        motivation_score=0.0,
+        rank_score=0.0,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
     )
+    if hasattr(lead, "score_json") and prov_json is not None:
+        lead.score_json = prov_json
+
     session.add(lead)
     await session.flush()
-
-    await enqueue_event(
-        session,
-        "lead.created",
-        {
-            "lead_id": lead.id,
-            "property_id": property_id,
-            "source": source.value,
-            "strategy": strategy.value,
-            "created_at": lead.created_at.isoformat(),
-        },
-    )
     return lead, True
 
 
-async def score_lead(session: AsyncSession, lead: Lead, prop: Property, is_auction: bool) -> None:
-    list_price = lead.list_price
+def _call_motivation_score(prop: Property, lead: Lead) -> float:
+    """
+    Your motivation scorer signature changed while refactoring.
+    This wrapper calls it safely no matter if it's:
+      motivation_score(prop)
+      motivation_score(lead, prop)
+      motivation_score(lead=..., prop=...)
+    """
+    try:
+        from ..scoring.motivation import motivation_score  # local import to avoid cycles
+    except Exception:
+        return 0.2
 
-    lead.arv_estimate = estimate_arv(list_price)
-    lead.rehab_estimate = estimate_rehab(prop.sqft)
-    lead.rent_estimate = estimate_rent(prop.beds, prop.sqft)
+    try:
+        sig = inspect.signature(motivation_score)
+    except Exception:
+        # best effort
+        try:
+            return float(motivation_score(prop))  # type: ignore
+        except Exception:
+            return 0.2
 
-    absentee = vacancy_proxy(prop.owner_mailing, prop.address_line) >= 1.0
-    yrs_held = years_since(prop.last_sale_date)
-    equity = equity_proxy(lead.arv_estimate, list_price)
+    params = sig.parameters
+    try:
+        if "lead" in params and "prop" in params:
+            return float(motivation_score(lead=lead, prop=prop))  # type: ignore
+        if len(params) == 2:
+            return float(motivation_score(lead, prop))  # type: ignore
+        return float(motivation_score(prop))  # type: ignore
+    except Exception:
+        return 0.2
 
-    mot = motivation_score(
-        MotivationSignals(
-            is_auction=is_auction,
-            absentee=absentee,
-            years_held=yrs_held,
-            equity_frac=equity,
-        )
-    )
 
-    deal = deal_score(
-        list_price=list_price,
-        arv=lead.arv_estimate,
-        rehab=lead.rehab_estimate,
-        rent=lead.rent_estimate,
-        strategy=lead.strategy.value,
-    )
+async def score_lead(session: AsyncSession, lead: Lead, prop: Property, **kwargs: Any) -> None:
+    """
+    Score lead using current scoring modules.
+    Accepts extra kwargs (is_auction, etc.) for backwards compatibility.
+    """
+    # Deal side
+    arv = estimate_arv(lead.list_price)
+    rehab = estimate_rehab(prop.sqft)
+    dscore = float(deal_score(lead.list_price, arv, rehab, lead.rent_estimate, strategy=str(lead.strategy.value)))
 
-    # --- Explain drivers (debuggable ranking) ---
-    drivers: dict[str, object] = {}
+    # Motivation side (safe wrapper across signature changes)
+    mscore = float(_call_motivation_score(prop, lead))
 
-    # Base discount is the core “is it under ARV”
-    if list_price is not None and lead.arv_estimate is not None and lead.arv_estimate > 0:
-        drivers["base_discount"] = max((lead.arv_estimate - list_price) / lead.arv_estimate, 0.0)
-        drivers["price_to_arv"] = list_price / lead.arv_estimate
+    # Rank
+    rscore = float(rank_score(dscore, mscore, strategy=str(lead.strategy.value)))
 
-    # Rental viability signals
-    if lead.strategy.value == "rental":
-        v = rental_viability(list_price, lead.rent_estimate)
-        drivers["gross_yield"] = v.gross_yield
-        drivers["dscr_proxy"] = v.dscr
-        drivers["coc_proxy"] = v.coc
-
-        # make sanity readable
-        if v.gross_yield is None:
-            drivers["rent_sanity"] = "unknown"
-        elif v.gross_yield >= 0.06:
-            drivers["rent_sanity"] = "ok"
-        elif v.gross_yield >= 0.04:
-            drivers["rent_sanity"] = "weak"
-        else:
-            drivers["rent_sanity"] = "bad"
-
-    lead.motivation_score = float(mot)
-    lead.deal_score = float(deal)
-    lead.rank_score = float(rank_score(deal, mot, lead.strategy.value))
-    lead.explain = explain(
-        deal,
-        mot,
-        is_auction=is_auction,
-        absentee=absentee,
-        equity=equity,
-        drivers=drivers,
-    )
-
+    lead.deal_score = dscore
+    lead.motivation_score = mscore
+    lead.rank_score = rscore
     lead.updated_at = datetime.utcnow()
+
+    # Explanation: compact but information-dense
+    drivers = {
+        "gross_yield": None,
+        "dscr_proxy": None,
+        "coc_proxy": None,
+        "rent_sanity": None,
+        "price_to_arv": None,
+        "base_discount": None,
+    }
+    try:
+        if lead.list_price and lead.rent_estimate and lead.list_price > 0:
+            drivers["gross_yield"] = (lead.rent_estimate * 12.0) / lead.list_price
+        if lead.list_price and arv and arv > 0:
+            drivers["price_to_arv"] = lead.list_price / arv
+            drivers["base_discount"] = max((arv - lead.list_price) / arv, 0.0)
+    except Exception:
+        pass
+
+    try:
+        ex = explain_ranker(
+            dscore,
+            mscore,
+            is_auction=bool(kwargs.get("is_auction", False)),
+            absentee=False,
+            equity=None,
+            drivers=drivers,
+        )
+    except Exception:
+        ex = f"deal={dscore:.2f} | motivation={mscore:.2f}"
+
+    if hasattr(lead, "explain_json"):
+        lead.explain_json = ex
+
     await session.flush()
