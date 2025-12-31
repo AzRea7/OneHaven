@@ -1,3 +1,4 @@
+# app/integrations/services/outbox.py
 from __future__ import annotations
 
 import json
@@ -19,12 +20,8 @@ async def enqueue_event(session: AsyncSession, event_type: str, payload: dict[st
 
 
 async def _build_sinks(session: AsyncSession) -> list[WebhookSink]:
-    """
-    v0: only webhooks. Expand later.
-    """
     sinks: list[WebhookSink] = []
     rows = (await session.execute(select(Integration).where(Integration.enabled == True))).scalars().all()  # noqa: E712
-
     for integ in rows:
         if integ.type != IntegrationType.webhook:
             continue
@@ -38,14 +35,9 @@ async def _build_sinks(session: AsyncSession) -> list[WebhookSink]:
 
 
 async def dispatch_pending_events(session: AsyncSession, batch_size: int = 50, max_attempts: int = 10) -> dict:
-    """
-    Pull a batch of pending events and deliver to all enabled sinks.
-    Idempotency strategy: outbox ensures each event is attempted safely;
-    receiver should handle duplicates by (event_id).
-    """
     sinks = await _build_sinks(session)
     if not sinks:
-        return {"delivered": 0, "failed": 0, "skipped_no_sinks": 1}
+        return {"delivered": 0, "failed": 0, "sinks": 0, "events": 0, "skipped_no_sinks": 1}
 
     stmt = (
         select(OutboxEvent)
@@ -71,14 +63,20 @@ async def dispatch_pending_events(session: AsyncSession, batch_size: int = 50, m
                 last_err = res.error
 
         ev.attempts += 1
+        ev.last_error = last_err
+
         if ok_all:
             ev.status = OutboxStatus.delivered
             ev.delivered_at = datetime.utcnow()
             ev.last_error = None
             delivered += 1
         else:
-            ev.status = OutboxStatus.pending  # remain pending for retry
-            ev.last_error = last_err
+            # If we’ve hit max attempts, flip to failed so it stops retrying forever
+            if ev.attempts >= max_attempts:
+                ev.status = OutboxStatus.failed
+            else:
+                ev.status = OutboxStatus.pending
             failed += 1
 
-    return {"delivered": delivered, "failed": failed, "sinks": len(sinks), "events": len(events)}
+    await session.flush()
+    return {"delivered": delivered, "failed": failed, "sinks": len(sinks), "events": len(events), "skipped_no_sinks": 0}

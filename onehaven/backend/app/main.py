@@ -1,8 +1,8 @@
+# app/main.py
 import json
 from fastapi import FastAPI, Depends, Query, HTTPException, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
-from .models import JobRun
 
 from .config import settings
 from .db import get_session, engine
@@ -10,7 +10,7 @@ from .models import (
     Base,
     Lead, Property,
     Integration, IntegrationType,
-    OutcomeType, LeadStatus
+    OutcomeType, LeadStatus, LeadSource,
 )
 from .schemas import (
     LeadOut, JobResult,
@@ -24,15 +24,12 @@ from .integrations.jobs.dispatch import run_dispatch
 from .services.outcomes import add_outcome_event, update_lead_status
 from .services.metrics import conversion_by_bucket, time_to_contact_by_bucket, roi_vs_realized
 from .connectors.wayne_auction import WayneAuctionConnector
+from .services.jobruns import start_job, finish_job_success, finish_job_fail
 
 app = FastAPI(title="OneHaven - Lead Truth Engine")
 
 
 def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
-    """
-    Minimal B2B guardrail. For dev demos you can leave API_KEY unset.
-    In prod: set API_KEY and require it for protected routes.
-    """
     if settings.API_KEY:
         if not x_api_key or x_api_key != settings.API_KEY:
             raise HTTPException(status_code=401, detail="Invalid API key")
@@ -40,7 +37,6 @@ def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Ke
 
 @app.on_event("startup")
 async def startup() -> None:
-    # For real deployments, swap this for Alembic migrations.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -48,11 +44,19 @@ async def startup() -> None:
 @app.post("/jobs/refresh", response_model=JobResult, dependencies=[Depends(require_api_key)])
 async def run_refresh(
     region: str = Query("se_michigan"),
+    max_price: float | None = Query(default=None, ge=0),
     session: AsyncSession = Depends(get_session),
 ) -> JobResult:
-    result = await refresh_region(session, region)
-    await session.commit()
-    return JobResult(**result)
+    jr = await start_job(session, "refresh_api")
+    try:
+        result = await refresh_region(session, region, max_price=max_price)
+        await finish_job_success(session, jr, result)
+        await session.commit()
+        return JobResult(**result)
+    except Exception as e:
+        await finish_job_fail(session, jr, e)
+        await session.commit()
+        raise
 
 
 @app.post("/jobs/dispatch", response_model=DispatchResult, dependencies=[Depends(require_api_key)])
@@ -60,9 +64,16 @@ async def dispatch_outbox(
     batch_size: int = Query(50, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> DispatchResult:
-    result = await run_dispatch(session=session, batch_size=batch_size)
-    await session.commit()
-    return DispatchResult(**result)
+    jr = await start_job(session, "dispatch_api")
+    try:
+        result = await run_dispatch(session=session, batch_size=batch_size)
+        await finish_job_success(session, jr, result)
+        await session.commit()
+        return DispatchResult(**result)
+    except Exception as e:
+        await finish_job_fail(session, jr, e)
+        await session.commit()
+        raise
 
 
 @app.post("/integrations", response_model=IntegrationOut, dependencies=[Depends(require_api_key)])
@@ -73,6 +84,11 @@ async def create_integration(
     if body.type != "webhook":
         raise HTTPException(status_code=400, detail="Only webhook integrations supported in v0")
 
+    # Soft guard: unique name (prevents sink spam)
+    existing = (await session.execute(select(Integration).where(Integration.name == body.name))).scalars().first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Integration name already exists. Use PATCH to update/disable.")
+
     cfg = {"url": body.url, "secret": body.secret}
     integ = Integration(
         name=body.name,
@@ -81,6 +97,40 @@ async def create_integration(
         config_json=json.dumps(cfg),
     )
     session.add(integ)
+    await session.commit()
+
+    return IntegrationOut(
+        id=integ.id,
+        name=integ.name,
+        type=integ.type.value,
+        enabled=integ.enabled,
+        created_at=integ.created_at,
+    )
+
+
+@app.patch("/integrations/{integration_id}", response_model=IntegrationOut, dependencies=[Depends(require_api_key)])
+async def update_integration(
+    integration_id: int,
+    enabled: bool | None = None,
+    url: str | None = None,
+    secret: str | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> IntegrationOut:
+    integ = (await session.execute(select(Integration).where(Integration.id == integration_id))).scalars().first()
+    if not integ:
+        raise HTTPException(status_code=404, detail="Integration not found")
+
+    if enabled is not None:
+        integ.enabled = bool(enabled)
+
+    if integ.type == IntegrationType.webhook and (url is not None or secret is not None):
+        cfg = json.loads(integ.config_json or "{}")
+        if url is not None:
+            cfg["url"] = url
+        if secret is not None:
+            cfg["secret"] = secret
+        integ.config_json = json.dumps(cfg)
+
     await session.commit()
 
     return IntegrationOut(
@@ -112,6 +162,8 @@ async def top_leads(
     zip: str = Query(..., min_length=5, max_length=10),
     strategy: str = Query("rental"),
     limit: int = Query(25, ge=1, le=200),
+    max_price: float | None = Query(default=None, ge=0),
+    source: str | None = Query(default=None),
     session: AsyncSession = Depends(get_session),
 ) -> list[LeadOut]:
     stmt = (
@@ -119,9 +171,17 @@ async def top_leads(
         .join(Property, Property.id == Lead.property_id)
         .where(Property.zipcode == zip)
         .where(Lead.strategy == strategy)
-        .order_by(desc(Lead.rank_score))
-        .limit(limit)
     )
+
+    if max_price is not None:
+        stmt = stmt.where(Lead.list_price.isnot(None)).where(Lead.list_price <= max_price)
+
+    if source is not None:
+        # Accept "rentcast_listing" or "wayne_auction"
+        stmt = stmt.where(Lead.source == LeadSource(source))
+
+    stmt = stmt.order_by(desc(Lead.rank_score)).limit(limit)
+
     rows = (await session.execute(stmt)).all()
 
     out: list[LeadOut] = []
@@ -150,8 +210,6 @@ async def top_leads(
         )
     return out
 
-
-# ----- Outcomes (feedback loop) -----
 
 @app.post("/leads/{lead_id}/status", response_model=OutcomeOut, dependencies=[Depends(require_api_key)])
 async def set_lead_status(
@@ -208,8 +266,6 @@ async def create_outcome(
     )
 
 
-# ----- Evaluation (sellability) -----
-
 @app.get("/metrics/conversion", response_model=list[ScoreBucketMetrics], dependencies=[Depends(require_api_key)])
 async def metrics_conversion(
     zip: str = Query(...),
@@ -239,12 +295,11 @@ async def metrics_roi(
     r = await roi_vs_realized(session, zip=zip, strategy=strategy)
     return RoiMetrics(**r)
 
-@app.get("/health")
-async def health(session: AsyncSession = Depends(get_session)):
-    rows = (await session.execute(
-        select(JobRun).order_by(desc(JobRun.started_at)).limit(10)
-    )).scalars().all()
 
+@app.get("/health", dependencies=[Depends(require_api_key)])
+async def health(session: AsyncSession = Depends(get_session)):
+    from .models import JobRun
+    rows = (await session.execute(select(JobRun).order_by(desc(JobRun.started_at)).limit(10))).scalars().all()
     return {
         "status": "ok",
         "recent_jobs": [
@@ -259,7 +314,8 @@ async def health(session: AsyncSession = Depends(get_session)):
         ],
     }
 
-@app.get("/connectors/wayne/health")
+
+@app.get("/connectors/wayne/health", dependencies=[Depends(require_api_key)])
 async def wayne_health():
     c = WayneAuctionConnector()
     return {
@@ -269,5 +325,25 @@ async def wayne_health():
         "leads_emitted": c.health.leads_emitted,
         "errors": c.health.errors,
         "last_error": c.health.last_error,
+        "snapshots_dir": "data/wayne_snapshots/",
+    }
+
+
+@app.get("/connectors/wayne/test", dependencies=[Depends(require_api_key)])
+async def wayne_test(zip: str = Query(...), limit: int = Query(50, ge=1, le=200)):
+    c = WayneAuctionConnector()
+    leads = await c.fetch_by_zip(zipcode=zip, limit=limit)
+    return {
+        "zip": zip,
+        "returned_leads": len(leads),
+        "health": {
+            "fetched": c.health.fetched,
+            "parsed_batches": c.health.parsed_batches,
+            "parsed_properties": c.health.parsed_properties,
+            "leads_emitted": c.health.leads_emitted,
+            "errors": c.health.errors,
+            "last_error": c.health.last_error,
+        },
+        "sample": [l.payload for l in leads[:3]],
         "snapshots_dir": "data/wayne_snapshots/",
     }

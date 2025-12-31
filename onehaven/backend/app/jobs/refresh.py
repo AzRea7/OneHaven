@@ -1,5 +1,5 @@
+# app/jobs/refresh.py
 from collections import defaultdict
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..connectors.rentcast import RentCastConnector
@@ -22,7 +22,15 @@ def _raw_type(payload: dict) -> str | None:
     return payload.get("propertyType") or payload.get("property_type") or payload.get("PropertyType")
 
 
-async def refresh_region(session: AsyncSession, region: str) -> dict:
+def _list_price(payload: dict) -> float | None:
+    v = payload.get("listPrice") or payload.get("price") or payload.get("listingPrice")
+    try:
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+async def refresh_region(session: AsyncSession, region: str, max_price: float | None = None) -> dict:
     drop_reasons = defaultdict(int)
     drop_by_raw_type = defaultdict(int)
     drop_by_norm_type = defaultdict(int)
@@ -45,6 +53,12 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
                 drop_reasons["missing_address_city_zip"] += 1
                 continue
 
+            lp = _list_price(raw.payload)
+            if max_price is not None and lp is not None and lp > max_price:
+                dropped += 1
+                drop_reasons["above_max_price"] += 1
+                continue
+
             prop = await upsert_property(session, raw.payload)
             if not prop:
                 dropped += 1
@@ -57,7 +71,6 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
                         drop_by_norm_type[str(nt)] += 1
                 continue
 
-            list_price = raw.payload.get("price") or raw.payload.get("listPrice")
             lead, was_created = await create_or_update_lead(
                 session=session,
                 property_id=prop.id,
@@ -67,15 +80,15 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
                 provenance=raw.provenance,
             )
 
-            if list_price:
-                lead.list_price = float(list_price)
+            if lp is not None:
+                lead.list_price = lp
 
             await score_lead(session, lead, prop, is_auction=False)
 
             created += 1 if was_created else 0
             updated += 0 if was_created else 1
 
-        # 2) Auctions
+        # 2) Auctions (usually no list_price; max_price doesn’t apply unless you enrich later)
         auctions = await wayne.fetch_by_zip(zipcode=z, limit=200)
         for raw in auctions:
             if _missing_core_fields(raw.payload):
@@ -109,7 +122,6 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
             created += 1 if was_created else 0
             updated += 0 if was_created else 1
 
-    # Flatten observability into drop_reasons (keeps response schema stable)
     for k, v in drop_by_raw_type.items():
         drop_reasons[f"raw_type::{k}"] += v
     for k, v in drop_by_norm_type.items():

@@ -1,6 +1,6 @@
+# app/services/ingest.py
 import json
 from datetime import datetime
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -79,9 +79,6 @@ async def create_or_update_lead(
     source_ref: str | None,
     provenance: dict,
 ) -> tuple[Lead, bool]:
-    """
-    Returns (lead, created_bool)
-    """
     stmt = select(Lead).where(
         Lead.property_id == property_id,
         Lead.source == source,
@@ -134,19 +131,12 @@ async def create_or_update_lead(
 
 
 async def score_lead(session: AsyncSession, lead: Lead, prop: Property, is_auction: bool) -> None:
-    """
-    v0 scoring: deterministic heuristics with explainability.
-    Replace with LightGBM models later.
-    """
-    # prices
     list_price = lead.list_price
 
-    # v0 estimates
     lead.arv_estimate = estimate_arv(list_price)
     lead.rehab_estimate = estimate_rehab(prop.sqft)
     lead.rent_estimate = estimate_rent(prop.beds, prop.sqft)
 
-    # signals
     absentee = vacancy_proxy(prop.owner_mailing, prop.address_line) >= 1.0
     yrs_held = years_since(prop.last_sale_date)
     equity = equity_proxy(lead.arv_estimate, list_price)
@@ -159,7 +149,14 @@ async def score_lead(session: AsyncSession, lead: Lead, prop: Property, is_aucti
             equity_frac=equity,
         )
     )
-    deal = deal_score(list_price, lead.arv_estimate, lead.rehab_estimate)
+
+    deal = deal_score(
+        list_price=list_price,
+        arv=lead.arv_estimate,
+        rehab=lead.rehab_estimate,
+        rent=lead.rent_estimate,
+        strategy=lead.strategy.value,
+    )
 
     lead.motivation_score = float(mot)
     lead.deal_score = float(deal)

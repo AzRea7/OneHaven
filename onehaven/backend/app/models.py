@@ -181,3 +181,16 @@ class JobRun(Base):
     status = Column(String, nullable=False, default="running")  # running/success/fail
     summary_json = Column(Text, nullable=True)
     error = Column(Text, nullable=True)
+
+class Integration(Base):
+    __tablename__ = "integrations"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_integration_name"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    type: Mapped[IntegrationType] = mapped_column(Enum(IntegrationType))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
