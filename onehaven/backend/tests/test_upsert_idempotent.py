@@ -1,8 +1,6 @@
 import pytest
-
 from app.db import async_session
 from app.services.ingest import upsert_property
-
 
 @pytest.mark.asyncio
 async def test_upsert_property_idempotent():

@@ -4,21 +4,33 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # --- Runtime ---
+    ENV: str = "dev"  # dev|prod
     HAVEN_DB_URL: str = "sqlite+aiosqlite:///./haven.db"
 
-    # Listings provider (RentCast today; could be swapped later)
+    # --- Minimal B2B Auth (API key) ---
+    # Send: X-API-Key: <key>
+    API_KEY: str | None = None
+
+    # --- Listings provider (RentCast today; could be swapped later) ---
     RENTCAST_API_KEY: str | None = None
     RENTCAST_BASE_URL: str = "https://api.rentcast.io/v1"
 
-    # Property records provider (keep separate from listings!)
+    # --- Property records provider (keep separate from listings!) ---
     PROPERTY_RECORDS_API_KEY: str | None = None
     PROPERTY_RECORDS_BASE_URL: str | None = None
 
+    # --- Wayne auction connector (public pages) ---
+    WAYNE_HTTP_TIMEOUT_S: int = 30
+    WAYNE_HTTP_CACHE_ENABLED: bool = True
+    WAYNE_HTTP_SLEEP_S: float = 0.4  # be polite
+    WAYNE_USER_AGENT: str = "OneHavenBot/0.1 (+contact: you@example.com)"
+
     DEFAULT_REGION: str = "se_michigan"
 
-    # Scheduler tuning
+    # --- Scheduler tuning ---
     SCHED_REFRESH_REGION: str = "se_michigan"
-    SCHED_REFRESH_INTERVAL_MINUTES: int = 1440
+    SCHED_REFRESH_INTERVAL_MINUTES: int = 1440  # daily
     SCHED_DISPATCH_INTERVAL_MINUTES: int = 5
 
 

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 from bs4 import BeautifulSoup
@@ -12,15 +15,19 @@ from bs4 import BeautifulSoup
 from ..config import settings
 from .base import RawLead
 
-WAYNE_SEARCH_URL = "https://waynecountytreasurermi.com/search.html"
+BASE = "https://waynecountytreasurermi.com/"
+BATCHES_URL = urljoin(BASE, "batches.html")
+PROPS_URL = urljoin(BASE, "properties.html")  # ?batchId=<id>
 
 
 @dataclass
-class ParserHealth:
+class WayneHealth:
     fetched: int = 0
-    parsed_rows: int = 0
+    parsed_batches: int = 0
+    parsed_properties: int = 0
     leads_emitted: int = 0
     errors: int = 0
+    last_error: str | None = None
 
 
 def _sha(s: str) -> str:
@@ -31,107 +38,138 @@ def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
+def _sleep_polite() -> None:
+    if settings.WAYNE_HTTP_SLEEP_S > 0:
+        time.sleep(settings.WAYNE_HTTP_SLEEP_S)
+
+
 class WayneAuctionConnector:
-    """
-    Production-grade scaffold:
-      - caches responses (simple disk snapshot)
-      - stores raw HTML snapshots for debugging
-      - has parser health counters
-    To fully finish: reverse engineer the POST/search calls if results are not in initial GET HTML.
-    """
     def __init__(self) -> None:
         self.timeout = settings.WAYNE_HTTP_TIMEOUT_S
-        self.cache_enabled = settings.WAYNE_HTTP_CACHE_ENABLED
         self.snap_dir = os.path.join(os.getcwd(), "data", "wayne_snapshots")
         _ensure_dir(self.snap_dir)
-        self.health = ParserHealth()
+        self.health = WayneHealth()
 
     def _snapshot_path(self, key: str) -> str:
         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         return os.path.join(self.snap_dir, f"{ts}_{key}.html")
 
-    async def _fetch_html(self, url: str, method: str = "GET", data: dict | None = None) -> str:
+    async def _fetch_html(self, url: str) -> str:
         self.health.fetched += 1
+        _sleep_polite()
 
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            if method.upper() == "POST":
-                r = await client.post(url, data=data or {})
-            else:
-                r = await client.get(url)
-
+        headers = {
+            "User-Agent": settings.WAYNE_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, headers=headers) as client:
+            r = await client.get(url)
             r.raise_for_status()
             html = r.text
 
-        # snapshot every fetch (cheap, and priceless for debugging)
-        path = self._snapshot_path(_sha(url + (str(data) if data else "")))
-        with open(path, "w", encoding="utf-8") as f:
+        with open(self._snapshot_path(_sha(url)), "w", encoding="utf-8") as f:
             f.write(html)
 
         return html
 
-    def _parse_results(self, html: str, zipcode: str, limit: int) -> list[RawLead]:
-        """
-        v1 parser: looks for tables/cards with addresses.
-        If site is JS-rendered, this will emit 0; then you must switch to POST endpoints.
-        """
+    def _parse_batch_ids(self, html: str) -> list[str]:
         soup = BeautifulSoup(html, "lxml")
-
-        leads: list[RawLead] = []
-
-        # Heuristic example: search for any row containing the zip and an address-like pattern
-        # Adjust once you inspect snapshots.
-        text = soup.get_text(" ", strip=True)
-        if zipcode not in text:
-            return leads
-
-        # Example: find all links that look like property detail pages
-        for a in soup.select("a[href]"):
-            href = a.get("href", "")
-            label = a.get_text(" ", strip=True)
-            if not label:
+        batch_ids: list[str] = []
+        for tr in soup.select("tr"):
+            tds = tr.find_all("td")
+            if not tds:
                 continue
-            if zipcode not in label and zipcode not in href:
-                continue
-            if "property" not in href and "details" not in href and "parcel" not in href:
+            first = tds[0].get_text(" ", strip=True)
+            if first and re.fullmatch(r"\d{1,6}", first):
+                batch_ids.append(first)
+
+        out, seen = [], set()
+        for b in batch_ids:
+            if b not in seen:
+                out.append(b)
+                seen.add(b)
+
+        self.health.parsed_batches += len(out)
+        return out
+
+    def _parse_property_rows(self, html: str) -> list[dict[str, Any]]:
+        soup = BeautifulSoup(html, "lxml")
+        props: list[dict[str, Any]] = []
+
+        for tr in soup.select("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 2:
                 continue
 
-            # minimal payload; you will enrich once you know fields
-            payload = {
-                "address": label,
-                "city": "DETROIT",
-                "state": "MI",
-                "zipCode": zipcode,
-                "propertyType": "single_family",
-            }
-            leads.append(
-                RawLead(
-                    source="wayne_auction",
-                    source_ref=href,
-                    payload=payload,
-                    provenance={"zip": zipcode, "provider": "wayne_treasurer", "detail_url": href},
-                )
+            row_text = tr.get_text(" ", strip=True)
+            zipm = re.search(r"\b\d{5}\b", row_text)
+            if not zipm:
+                continue
+
+            detail_href = None
+            a = tr.find("a", href=True)
+            if a:
+                detail_href = a["href"]
+
+            addr = tds[1].get_text(" ", strip=True)
+
+            props.append(
+                {
+                    "address_line": addr,
+                    "zip": zipm.group(0),
+                    "detail_url": urljoin(BASE, detail_href) if detail_href else None,
+                    "raw_row": row_text[:500],
+                }
             )
-            if len(leads) >= limit:
-                break
 
-        self.health.parsed_rows += len(leads)
-        self.health.leads_emitted += len(leads)
-        return leads
+        self.health.parsed_properties += len(props)
+        return props
 
     async def fetch_by_zip(self, zipcode: str, limit: int = 200) -> list[RawLead]:
         try:
-            # v0 GET
-            html = await self._fetch_html(WAYNE_SEARCH_URL)
+            batches_html = await self._fetch_html(BATCHES_URL)
+            batch_ids = self._parse_batch_ids(batches_html)
 
-            leads = self._parse_results(html, zipcode=zipcode, limit=limit)
+            leads: list[RawLead] = []
+            for bid in batch_ids[:25]:
+                props_html = await self._fetch_html(f"{PROPS_URL}?batchId={bid}")
+                rows = self._parse_property_rows(props_html)
 
-            # If 0 leads, it may require POST search:
-            # Once you inspect snapshot HTML, you’ll find the form names and post URL.
-            # Then you implement:
-            #   html = await self._fetch_html(WAYNE_SEARCH_URL, method="POST", data={"zip":zipcode,...})
-            #   leads = self._parse_results(html,...)
+                for r in rows:
+                    if r["zip"] != zipcode:
+                        continue
+
+                    payload = {
+                        "addressLine": r["address_line"],
+                        "city": "DETROIT",  # fallback until you enrich
+                        "state": "MI",
+                        "zipCode": zipcode,
+                        "propertyType": "single_family",
+                    }
+
+                    leads.append(
+                        RawLead(
+                            source="wayne_auction",
+                            source_ref=r.get("detail_url") or f"batch:{bid}:{_sha(r['raw_row'])}",
+                            payload=payload,
+                            provenance={
+                                "zip": zipcode,
+                                "provider": "wayne_treasurer",
+                                "batch_id": bid,
+                                "detail_url": r.get("detail_url"),
+                            },
+                        )
+                    )
+                    if len(leads) >= limit:
+                        break
+
+                if len(leads) >= limit:
+                    break
+
+            self.health.leads_emitted += len(leads)
             return leads
 
-        except Exception:
+        except Exception as e:
             self.health.errors += 1
+            self.health.last_error = str(e)
             return []

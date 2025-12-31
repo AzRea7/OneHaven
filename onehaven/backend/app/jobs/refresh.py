@@ -6,6 +6,7 @@ from ..connectors.rentcast import RentCastConnector
 from ..connectors.wayne_auction import WayneAuctionConnector
 from ..models import LeadSource, Strategy
 from ..services.ingest import upsert_property, create_or_update_lead, score_lead
+from ..services.normalize import normalize_property_type
 
 SE_MICHIGAN_ZIPS = ["48009", "48084", "48301", "48067", "48306", "48304", "48302", "48226", "48201"]
 
@@ -13,12 +14,19 @@ SE_MICHIGAN_ZIPS = ["48009", "48084", "48301", "48067", "48306", "48304", "48302
 def _missing_core_fields(payload: dict) -> bool:
     addr = payload.get("address") or payload.get("addressLine") or payload.get("street") or ""
     city = payload.get("city") or ""
-    zipc = payload.get("zip") or payload.get("zipcode") or payload.get("zipCode") or payload.get("zipCode") or ""
+    zipc = payload.get("zip") or payload.get("zipcode") or payload.get("zipCode") or ""
     return not (addr and city and zipc)
+
+
+def _raw_type(payload: dict) -> str | None:
+    return payload.get("propertyType") or payload.get("property_type") or payload.get("PropertyType")
 
 
 async def refresh_region(session: AsyncSession, region: str) -> dict:
     drop_reasons = defaultdict(int)
+    drop_by_raw_type = defaultdict(int)
+    drop_by_norm_type = defaultdict(int)
+
     created = 0
     updated = 0
     dropped = 0
@@ -41,10 +49,16 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
             if not prop:
                 dropped += 1
                 drop_reasons["invalid_or_disallowed_property"] += 1
+                rt = _raw_type(raw.payload)
+                if rt:
+                    drop_by_raw_type[str(rt)] += 1
+                    nt = normalize_property_type(str(rt))
+                    if nt:
+                        drop_by_norm_type[str(nt)] += 1
                 continue
 
             list_price = raw.payload.get("price") or raw.payload.get("listPrice")
-            res = await create_or_update_lead(
+            lead, was_created = await create_or_update_lead(
                 session=session,
                 property_id=prop.id,
                 source=LeadSource.rentcast_listing,
@@ -53,23 +67,15 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
                 provenance=raw.provenance,
             )
 
-            # Support both return styles: Lead OR (Lead, created_bool)
-            if isinstance(res, tuple):
-                lead, was_created = res
-            else:
-                lead, was_created = res, False
-
             if list_price:
                 lead.list_price = float(list_price)
 
             await score_lead(session, lead, prop, is_auction=False)
 
-            if was_created:
-                created += 1
-            else:
-                updated += 1
+            created += 1 if was_created else 0
+            updated += 0 if was_created else 1
 
-        # 2) Auctions (still placeholder parser in repo snapshot)
+        # 2) Auctions
         auctions = await wayne.fetch_by_zip(zipcode=z, limit=200)
         for raw in auctions:
             if _missing_core_fields(raw.payload):
@@ -81,9 +87,15 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
             if not prop:
                 dropped += 1
                 drop_reasons["invalid_or_disallowed_property"] += 1
+                rt = _raw_type(raw.payload)
+                if rt:
+                    drop_by_raw_type[str(rt)] += 1
+                    nt = normalize_property_type(str(rt))
+                    if nt:
+                        drop_by_norm_type[str(nt)] += 1
                 continue
 
-            res = await create_or_update_lead(
+            lead, was_created = await create_or_update_lead(
                 session=session,
                 property_id=prop.id,
                 source=LeadSource.wayne_auction,
@@ -92,17 +104,16 @@ async def refresh_region(session: AsyncSession, region: str) -> dict:
                 provenance=raw.provenance,
             )
 
-            if isinstance(res, tuple):
-                lead, was_created = res
-            else:
-                lead, was_created = res, False
-
             await score_lead(session, lead, prop, is_auction=True)
 
-            if was_created:
-                created += 1
-            else:
-                updated += 1
+            created += 1 if was_created else 0
+            updated += 0 if was_created else 1
+
+    # Flatten observability into drop_reasons (keeps response schema stable)
+    for k, v in drop_by_raw_type.items():
+        drop_reasons[f"raw_type::{k}"] += v
+    for k, v in drop_by_norm_type.items():
+        drop_reasons[f"norm_type::{k}"] += v
 
     return {
         "created_leads": created,

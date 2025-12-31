@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import String, Integer, Float, DateTime, Text, Enum, UniqueConstraint, Boolean
+from sqlalchemy import String, Column, Integer, Float, DateTime, Text, Enum, UniqueConstraint, Boolean
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -171,3 +171,13 @@ class OutcomeEvent(Base):
     source: Mapped[str] = mapped_column(String(60), default="manual")
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class JobRun(Base):
+    __tablename__ = "job_runs"
+    id = Column(Integer, primary_key=True)
+    job_name = Column(String, nullable=False)           # refresh / dispatch
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+    status = Column(String, nullable=False, default="running")  # running/success/fail
+    summary_json = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)

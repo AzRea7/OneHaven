@@ -1,8 +1,10 @@
 import json
-from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi import FastAPI, Depends, Query, HTTPException, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
+from .models import JobRun
 
+from .config import settings
 from .db import get_session, engine
 from .models import (
     Base,
@@ -21,17 +23,29 @@ from .jobs.refresh import refresh_region
 from .integrations.jobs.dispatch import run_dispatch
 from .services.outcomes import add_outcome_event, update_lead_status
 from .services.metrics import conversion_by_bucket, time_to_contact_by_bucket, roi_vs_realized
+from .connectors.wayne_auction import WayneAuctionConnector
 
 app = FastAPI(title="OneHaven - Lead Truth Engine")
 
 
+def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+    """
+    Minimal B2B guardrail. For dev demos you can leave API_KEY unset.
+    In prod: set API_KEY and require it for protected routes.
+    """
+    if settings.API_KEY:
+        if not x_api_key or x_api_key != settings.API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+
 @app.on_event("startup")
 async def startup() -> None:
+    # For real deployments, swap this for Alembic migrations.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 
-@app.post("/jobs/refresh", response_model=JobResult)
+@app.post("/jobs/refresh", response_model=JobResult, dependencies=[Depends(require_api_key)])
 async def run_refresh(
     region: str = Query("se_michigan"),
     session: AsyncSession = Depends(get_session),
@@ -41,7 +55,7 @@ async def run_refresh(
     return JobResult(**result)
 
 
-@app.post("/jobs/dispatch", response_model=DispatchResult)
+@app.post("/jobs/dispatch", response_model=DispatchResult, dependencies=[Depends(require_api_key)])
 async def dispatch_outbox(
     batch_size: int = Query(50, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
@@ -51,7 +65,7 @@ async def dispatch_outbox(
     return DispatchResult(**result)
 
 
-@app.post("/integrations", response_model=IntegrationOut)
+@app.post("/integrations", response_model=IntegrationOut, dependencies=[Depends(require_api_key)])
 async def create_integration(
     body: IntegrationCreate,
     session: AsyncSession = Depends(get_session),
@@ -78,7 +92,7 @@ async def create_integration(
     )
 
 
-@app.get("/integrations", response_model=list[IntegrationOut])
+@app.get("/integrations", response_model=list[IntegrationOut], dependencies=[Depends(require_api_key)])
 async def list_integrations(session: AsyncSession = Depends(get_session)) -> list[IntegrationOut]:
     rows = (await session.execute(select(Integration).order_by(Integration.id.asc()))).scalars().all()
     return [
@@ -139,7 +153,7 @@ async def top_leads(
 
 # ----- Outcomes (feedback loop) -----
 
-@app.post("/leads/{lead_id}/status", response_model=OutcomeOut)
+@app.post("/leads/{lead_id}/status", response_model=OutcomeOut, dependencies=[Depends(require_api_key)])
 async def set_lead_status(
     lead_id: int,
     body: LeadStatusUpdate,
@@ -166,7 +180,7 @@ async def set_lead_status(
     )
 
 
-@app.post("/events/outcome", response_model=OutcomeOut)
+@app.post("/events/outcome", response_model=OutcomeOut, dependencies=[Depends(require_api_key)])
 async def create_outcome(
     body: OutcomeCreate,
     session: AsyncSession = Depends(get_session),
@@ -196,7 +210,7 @@ async def create_outcome(
 
 # ----- Evaluation (sellability) -----
 
-@app.get("/metrics/conversion", response_model=list[ScoreBucketMetrics])
+@app.get("/metrics/conversion", response_model=list[ScoreBucketMetrics], dependencies=[Depends(require_api_key)])
 async def metrics_conversion(
     zip: str = Query(...),
     strategy: str = Query("rental"),
@@ -206,7 +220,7 @@ async def metrics_conversion(
     return [ScoreBucketMetrics(**r) for r in rows]
 
 
-@app.get("/metrics/time-to-contact", response_model=list[TimeToContactMetrics])
+@app.get("/metrics/time-to-contact", response_model=list[TimeToContactMetrics], dependencies=[Depends(require_api_key)])
 async def metrics_time_to_contact(
     zip: str = Query(...),
     strategy: str = Query("rental"),
@@ -216,7 +230,7 @@ async def metrics_time_to_contact(
     return [TimeToContactMetrics(**r) for r in rows]
 
 
-@app.get("/metrics/roi", response_model=RoiMetrics)
+@app.get("/metrics/roi", response_model=RoiMetrics, dependencies=[Depends(require_api_key)])
 async def metrics_roi(
     zip: str = Query(...),
     strategy: str = Query("rental"),
@@ -224,3 +238,36 @@ async def metrics_roi(
 ) -> RoiMetrics:
     r = await roi_vs_realized(session, zip=zip, strategy=strategy)
     return RoiMetrics(**r)
+
+@app.get("/health")
+async def health(session: AsyncSession = Depends(get_session)):
+    rows = (await session.execute(
+        select(JobRun).order_by(desc(JobRun.started_at)).limit(10)
+    )).scalars().all()
+
+    return {
+        "status": "ok",
+        "recent_jobs": [
+            {
+                "job_name": r.job_name,
+                "started_at": r.started_at,
+                "finished_at": r.finished_at,
+                "status": r.status,
+                "error": r.error,
+            }
+            for r in rows
+        ],
+    }
+
+@app.get("/connectors/wayne/health")
+async def wayne_health():
+    c = WayneAuctionConnector()
+    return {
+        "fetched": c.health.fetched,
+        "parsed_batches": c.health.parsed_batches,
+        "parsed_properties": c.health.parsed_properties,
+        "leads_emitted": c.health.leads_emitted,
+        "errors": c.health.errors,
+        "last_error": c.health.last_error,
+        "snapshots_dir": "data/wayne_snapshots/",
+    }
