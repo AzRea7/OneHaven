@@ -41,63 +41,70 @@ def _ensure_dir(p: str) -> None:
 
 
 def _sleep_polite() -> None:
-    if settings.WAYNE_HTTP_SLEEP_S > 0:
+    if getattr(settings, "WAYNE_HTTP_SLEEP_S", 0) and settings.WAYNE_HTTP_SLEEP_S > 0:
         time.sleep(settings.WAYNE_HTTP_SLEEP_S)
 
 
 class WayneAuctionConnector:
     """
-    Conservative connector:
-      - snapshots fetched HTML
-      - extracts batch ids, then property rows
-      - emits RawLead objects for the target zip
+    Conservative HTML connector for Wayne County Treasurer site.
 
-    SSL strategy:
-      - default: verify SSL using certifi bundle
-      - dev-only escape hatch: WAYNE_VERIFY_SSL=0 (do not use in prod)
+    Notes:
+      - HTML scraping is brittle. Snapshots are saved to data/wayne_snapshots for debugging.
+      - SSL verification can fail on some Windows setups. We default to verify=True and only
+        allow an insecure fallback if WAYNE_ALLOW_INSECURE_SSL=true.
     """
 
     def __init__(self) -> None:
-        self.timeout = settings.WAYNE_HTTP_TIMEOUT_S
+        self.timeout = getattr(settings, "WAYNE_HTTP_TIMEOUT_S", 20)
         self.snap_dir = os.path.join(os.getcwd(), "data", "wayne_snapshots")
         _ensure_dir(self.snap_dir)
         self.health = WayneHealth()
 
+        # Settings (provide defaults if not in your Settings model yet)
+        self.user_agent = getattr(settings, "WAYNE_USER_AGENT", "onehaven/1.0 (+https://localhost)")
+        self.allow_insecure = bool(getattr(settings, "WAYNE_ALLOW_INSECURE_SSL", False))
+
     def _snapshot_path(self, key: str) -> str:
         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         return os.path.join(self.snap_dir, f"{ts}_{key}.html")
-
-    def _http_verify(self) -> bool | str:
-        """
-        httpx 'verify' can be:
-          - True/False
-          - path to CA bundle
-        """
-        if not settings.WAYNE_VERIFY_SSL:
-            return False
-        # If user provides explicit CA bundle path, use it; else certifi.
-        if getattr(settings, "WAYNE_CA_BUNDLE", None):
-            return settings.WAYNE_CA_BUNDLE
-        return certifi.where()
 
     async def _fetch_html(self, url: str) -> str:
         self.health.fetched += 1
         _sleep_polite()
 
         headers = {
-            "User-Agent": settings.WAYNE_USER_AGENT,
+            "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
+
+        # Use certifi CA bundle explicitly (helps on Windows)
+        verify: Any = certifi.where()
 
         async with httpx.AsyncClient(
             timeout=self.timeout,
             follow_redirects=True,
             headers=headers,
-            verify=self._http_verify(),
+            verify=verify,
         ) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            html = r.text
+            try:
+                r = await client.get(url)
+                r.raise_for_status()
+                html = r.text
+            except Exception as e:
+                # Optional insecure fallback for dev only
+                if self.allow_insecure and "CERTIFICATE_VERIFY_FAILED" in str(e):
+                    async with httpx.AsyncClient(
+                        timeout=self.timeout,
+                        follow_redirects=True,
+                        headers=headers,
+                        verify=False,
+                    ) as client2:
+                        r = await client2.get(url)
+                        r.raise_for_status()
+                        html = r.text
+                else:
+                    raise
 
         with open(self._snapshot_path(_sha(url)), "w", encoding="utf-8") as f:
             f.write(html)
@@ -116,7 +123,7 @@ class WayneAuctionConnector:
             if first and re.fullmatch(r"\d{1,6}", first):
                 batch_ids.append(first)
 
-        # de-dupe keep order
+        # de-dupe while keeping order
         out: list[str] = []
         seen: set[str] = set()
         for b in batch_ids:
@@ -162,8 +169,7 @@ class WayneAuctionConnector:
 
     async def fetch_by_zip(self, zipcode: str, limit: int = 200) -> list[RawLead]:
         """
-        Return auction leads for a single zip.
-        Payload intentionally minimal; enrichment comes later.
+        Returns RawLead items (not yet deduped / normalized into your DB).
         """
         try:
             batches_html = await self._fetch_html(BATCHES_URL)
@@ -171,7 +177,7 @@ class WayneAuctionConnector:
 
             leads: list[RawLead] = []
 
-            # keep bounded; auctions pages can be big
+            # limit batches to avoid hammering the site
             for bid in batch_ids[:25]:
                 props_html = await self._fetch_html(f"{PROPS_URL}?batchId={bid}")
                 rows = self._parse_property_rows(props_html)
@@ -182,9 +188,7 @@ class WayneAuctionConnector:
 
                     payload = {
                         "addressLine": r["address_line"],
-                        # TODO: if you later parse details page, you can set actual city.
-                        # For now, we keep a safe fallback.
-                        "city": "DETROIT",
+                        "city": "DETROIT",  # placeholder until enriched
                         "state": "MI",
                         "zipCode": zipcode,
                         "propertyType": "single_family",

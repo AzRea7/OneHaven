@@ -1,18 +1,26 @@
 # app/services/ingest.py
+from __future__ import annotations
+
 import json
 from datetime import datetime
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Property, Lead, LeadSource, Strategy
-from .entity_resolution import canonicalize_address
-from .normalize import normalize_property_type, is_allowed_type
 from ..integrations.services.outbox import enqueue_event
-
-from ..scoring.deal import estimate_arv, estimate_rehab, estimate_rent, deal_score
+from ..models import Lead, LeadSource, Property, Strategy
+from ..scoring.deal import (
+    deal_score,
+    estimate_arv,
+    estimate_rehab,
+    estimate_rent,
+    rental_viability,
+)
 from ..scoring.motivation import MotivationSignals, motivation_score
-from ..scoring.ranker import rank_score, explain
-from .features import years_since, equity_proxy, vacancy_proxy
+from ..scoring.ranker import explain, rank_score
+from .entity_resolution import canonicalize_address
+from .features import equity_proxy, vacancy_proxy, years_since
+from .normalize import is_allowed_type, normalize_property_type
 
 
 def _num(x):
@@ -50,7 +58,9 @@ async def upsert_property(session: AsyncSession, payload: dict) -> Property | No
     if existing:
         existing.property_type = existing.property_type or norm_type
         existing.beds = existing.beds or payload.get("bedrooms") or payload.get("beds") or payload.get("BedroomsTotal")
-        existing.baths = existing.baths or payload.get("bathrooms") or payload.get("baths") or payload.get("BathroomsTotal")
+        existing.baths = (
+            existing.baths or payload.get("bathrooms") or payload.get("baths") or payload.get("BathroomsTotal")
+        )
         existing.sqft = existing.sqft or payload.get("squareFeet") or payload.get("sqft") or payload.get("LivingArea")
         return existing
 
@@ -158,10 +168,42 @@ async def score_lead(session: AsyncSession, lead: Lead, prop: Property, is_aucti
         strategy=lead.strategy.value,
     )
 
+    # --- Explain drivers (debuggable ranking) ---
+    drivers: dict[str, object] = {}
+
+    # Base discount is the core “is it under ARV”
+    if list_price is not None and lead.arv_estimate is not None and lead.arv_estimate > 0:
+        drivers["base_discount"] = max((lead.arv_estimate - list_price) / lead.arv_estimate, 0.0)
+        drivers["price_to_arv"] = list_price / lead.arv_estimate
+
+    # Rental viability signals
+    if lead.strategy.value == "rental":
+        v = rental_viability(list_price, lead.rent_estimate)
+        drivers["gross_yield"] = v.gross_yield
+        drivers["dscr_proxy"] = v.dscr
+        drivers["coc_proxy"] = v.coc
+
+        # make sanity readable
+        if v.gross_yield is None:
+            drivers["rent_sanity"] = "unknown"
+        elif v.gross_yield >= 0.06:
+            drivers["rent_sanity"] = "ok"
+        elif v.gross_yield >= 0.04:
+            drivers["rent_sanity"] = "weak"
+        else:
+            drivers["rent_sanity"] = "bad"
+
     lead.motivation_score = float(mot)
     lead.deal_score = float(deal)
     lead.rank_score = float(rank_score(deal, mot, lead.strategy.value))
-    lead.explain = explain(deal, mot, is_auction=is_auction, absentee=absentee, equity=equity)
+    lead.explain = explain(
+        deal,
+        mot,
+        is_auction=is_auction,
+        absentee=absentee,
+        equity=equity,
+        drivers=drivers,
+    )
 
     lead.updated_at = datetime.utcnow()
     await session.flush()

@@ -439,3 +439,108 @@ async def debug_leads_stats(
         )
     out.sort(key=lambda x: x["zip"])
     return out
+
+
+@app.get("/debug/leads/quality", dependencies=[Depends(require_api_key)])
+async def debug_leads_quality(
+    zips: str | None = Query(default=None, description="Comma-separated zips filter"),
+    strategy: str | None = Query(default=None, description="Optional: rental|flip"),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Data quality gates dashboard.
+    Shows missing-field rates and basic sanity failure rates by zip.
+
+    This is what stops “garbage leads” from quietly dominating your queue.
+    """
+    zip_filter = None
+    if zips:
+        zip_filter = {z.strip() for z in zips.split(",") if z.strip()}
+
+    stmt = (
+        select(Lead, Property)
+        .join(Property, Property.id == Lead.property_id)
+    )
+    if zip_filter:
+        stmt = stmt.where(Property.zipcode.in_(zip_filter))
+    if strategy:
+        stmt = stmt.where(Lead.strategy == strategy)
+
+    rows = (await session.execute(stmt)).all()
+    if not rows:
+        return []
+
+    # aggregate per zip
+    agg: dict[str, dict] = {}
+    for lead, prop in rows:
+        z = prop.zipcode
+        a = agg.setdefault(
+            z,
+            {
+                "zip": z,
+                "count": 0,
+                "missing_list_price": 0,
+                "missing_rent_estimate": 0,
+                "missing_beds": 0,
+                "missing_baths": 0,
+                "missing_sqft": 0,
+                "missing_latlon": 0,
+                "rent_sanity_bad": 0,
+                "counts_by_source": {},
+                "counts_by_property_type": {},
+            },
+        )
+
+        a["count"] += 1
+
+        if lead.list_price is None:
+            a["missing_list_price"] += 1
+        if lead.rent_estimate is None:
+            a["missing_rent_estimate"] += 1
+        if prop.beds is None:
+            a["missing_beds"] += 1
+        if prop.baths is None:
+            a["missing_baths"] += 1
+        if prop.sqft is None:
+            a["missing_sqft"] += 1
+        if prop.lat is None or prop.lon is None:
+            a["missing_latlon"] += 1
+
+        # sanity “bad” = gross_yield < 4% when we can compute
+        try:
+            if lead.list_price and lead.rent_estimate and lead.list_price > 0 and lead.rent_estimate > 0:
+                gross_yield = (lead.rent_estimate * 12.0) / lead.list_price
+                if gross_yield < 0.04:
+                    a["rent_sanity_bad"] += 1
+        except Exception:
+            pass
+
+        src = lead.source.value if hasattr(lead.source, "value") else str(lead.source)
+        a["counts_by_source"][src] = int(a["counts_by_source"].get(src, 0)) + 1
+
+        pt = prop.property_type or "unknown"
+        a["counts_by_property_type"][pt] = int(a["counts_by_property_type"].get(pt, 0)) + 1
+
+    # finalize rates
+    out = []
+    for z, a in sorted(agg.items()):
+        n = max(int(a["count"]), 1)
+        out.append(
+            {
+                "zip": z,
+                "count": int(a["count"]),
+                "missing_rates": {
+                    "list_price": a["missing_list_price"] / n,
+                    "rent_estimate": a["missing_rent_estimate"] / n,
+                    "beds": a["missing_beds"] / n,
+                    "baths": a["missing_baths"] / n,
+                    "sqft": a["missing_sqft"] / n,
+                    "latlon": a["missing_latlon"] / n,
+                },
+                "rent_sanity_bad_rate": a["rent_sanity_bad"] / n,
+                "counts_by_source": a["counts_by_source"],
+                "counts_by_property_type": a["counts_by_property_type"],
+            }
+        )
+
+    return out
