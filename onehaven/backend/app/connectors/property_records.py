@@ -5,13 +5,16 @@ from ..config import settings
 class PropertyRecordsClient:
     """
     Minimal enrichment client. Returns dict you merge into your Property.
+    Intentionally decoupled from listings provider.
     """
+
     def __init__(self) -> None:
+        # If you don't set PROPERTY_RECORDS_BASE_URL/KEY, this client is effectively disabled.
         self.base = settings.PROPERTY_RECORDS_BASE_URL
         self.key = settings.PROPERTY_RECORDS_API_KEY
 
     async def enrich(self, address: str, city: str, state: str, zipcode: str) -> dict:
-        if not self.key:
+        if not self.key or not self.base:
             return {}
 
         headers = {"X-Api-Key": self.key}

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..models import Property, Lead, LeadSource, Strategy
 from .entity_resolution import canonicalize_address
 from .normalize import normalize_property_type, is_allowed_type
-from .outbox import enqueue_event
+from ..integrations.services.outbox import enqueue_event
 
 from ..scoring.deal import estimate_arv, estimate_rehab, estimate_rent, deal_score
 from ..scoring.motivation import MotivationSignals, motivation_score
