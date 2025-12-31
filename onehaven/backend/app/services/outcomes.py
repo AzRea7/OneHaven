@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Lead, LeadStatus, OutcomeEvent, OutcomeType
 from ..integrations.services.outbox import enqueue_event
+from ..models import Lead, LeadStatus, OutcomeEvent, OutcomeType
 
 # Define the funnel order (monotonic progression)
 _STAGE_ORDER: dict[OutcomeType, int] = {
@@ -20,16 +21,61 @@ _STAGE_ORDER: dict[OutcomeType, int] = {
 
 _TERMINAL: set[OutcomeType] = {OutcomeType.closed, OutcomeType.dead}
 
+
 def _implied_lead_status(outcome_type: OutcomeType) -> LeadStatus | None:
-    # This maps outcome events into operational statuses.
-    # Keep it simple and consistent with your UI expectations.
-    if outcome_type in (OutcomeType.contacted, OutcomeType.responded, OutcomeType.appointment_set, OutcomeType.under_contract):
+    # Map outcome events -> operational statuses (simple + consistent)
+    if outcome_type in (
+        OutcomeType.contacted,
+        OutcomeType.responded,
+        OutcomeType.appointment_set,
+        OutcomeType.under_contract,
+    ):
         return LeadStatus.contacted
     if outcome_type == OutcomeType.closed:
         return LeadStatus.closed
     if outcome_type == OutcomeType.dead:
         return LeadStatus.dead
     return None
+
+
+async def update_lead_status(
+    session: AsyncSession,
+    lead_id: int,
+    status: LeadStatus,
+    occurred_at: datetime | None,
+    notes: str | None,
+    source: str = "manual",
+) -> Lead:
+    """
+    Explicit status transition endpoint helper.
+
+    This is separate from outcome events:
+    - outcomes represent "funnel facts" (contacted/responded/etc.)
+    - status represents your operational queue state (new/qualified/contacted/...)
+    """
+    lead = (await session.execute(select(Lead).where(Lead.id == lead_id))).scalars().first()
+    if not lead:
+        raise ValueError(f"Lead {lead_id} not found")
+
+    lead.status = status
+    lead.updated_at = datetime.utcnow()
+    await session.flush()
+
+    # Emit outbox event (webhooks / integrations)
+    await enqueue_event(
+        session,
+        "lead.status_changed",
+        {
+            "lead_id": lead_id,
+            "status": status.value,
+            "occurred_at": (occurred_at or datetime.utcnow()).isoformat(),
+            "source": source,
+            "notes": notes,
+        },
+    )
+
+    return lead
+
 
 async def add_outcome_event(
     session: AsyncSession,
@@ -47,32 +93,31 @@ async def add_outcome_event(
 
     now = occurred_at or datetime.utcnow()
 
-    # Pull existing outcomes for this lead (we enforce terminal consistency)
     existing = (
-        await session.execute(select(OutcomeEvent).where(OutcomeEvent.lead_id == lead_id).order_by(OutcomeEvent.occurred_at.asc()))
+        await session.execute(
+            select(OutcomeEvent)
+            .where(OutcomeEvent.lead_id == lead_id)
+            .order_by(OutcomeEvent.occurred_at.asc())
+        )
     ).scalars().all()
 
     existing_types = [e.outcome_type for e in existing]
     existing_terminal = next((t for t in existing_types if t in _TERMINAL), None)
 
-    # Terminal rule: once closed or dead, you cannot record the opposite terminal later.
-    # (If you truly need to correct a mistaken entry, do it by editing/deleting in DB or add an admin endpoint later.)
+    # Terminal rule: once closed or dead, refuse conflicting terminal
     if existing_terminal and outcome_type in _TERMINAL and outcome_type != existing_terminal:
         raise ValueError(
             f"Lead {lead_id} already has terminal outcome '{existing_terminal.value}'. "
             f"Refusing to add conflicting terminal '{outcome_type.value}'."
         )
 
-    # Optional: prevent nonsensical back-in-time stages (keep it permissive but sane).
-    # We allow duplicates (e.g. multiple contact attempts) but stage should not go backwards *as the max stage reached*.
+    # Optional: warn if logging stage "backwards" vs max stage reached
     max_stage = 0
     for t in existing_types:
         max_stage = max(max_stage, _STAGE_ORDER.get(t, 0))
 
     new_stage = _STAGE_ORDER.get(outcome_type, 0)
     if outcome_type not in _TERMINAL and new_stage and new_stage < max_stage:
-        # Not fatal—people sometimes log late. Still, it’s good to flag.
-        # You can tighten this to raise later.
         notes = (notes or "").strip()
         notes = (notes + " | WARN: logged out-of-order").strip(" |")
 
@@ -88,7 +133,7 @@ async def add_outcome_event(
     session.add(ev)
     await session.flush()
 
-    # Update lead operational status (so the UI + queues are consistent)
+    # Update lead operational status (UI/queues)
     implied = _implied_lead_status(outcome_type)
     if implied is not None:
         lead.status = implied

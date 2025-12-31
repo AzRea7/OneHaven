@@ -1,3 +1,4 @@
+# onehaven/backend/app/connectors/rentcast.py
 from __future__ import annotations
 
 import json
@@ -13,10 +14,9 @@ from ..config import settings
 
 def _write_sample(name: str, obj: dict, max_bytes: int = 200_000) -> None:
     """
-    Writes a small number of diagnostic JSON samples for payloads that fail
-    core-field requirements (addressLine/city/zipCode).
-
-    This is intentionally local-only and should be gitignored (data/).
+    Writes diagnostic JSON samples for payloads that fail core-field requirements
+    (or for investigating missing sqft/lat/lon key mapping).
+    Local-only; keep data/ gitignored.
     """
     os.makedirs("data/rentcast_samples", exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -26,15 +26,23 @@ def _write_sample(name: str, obj: dict, max_bytes: int = 200_000) -> None:
         f.write(blob)
 
 
+def _pick(item: dict[str, Any], keys: list[str]) -> Any:
+    for k in keys:
+        if k in item and item.get(k) not in (None, "", []):
+            return item.get(k)
+    return None
+
+
 def _canonicalize_listing_payload(item: dict[str, Any]) -> dict[str, Any]:
     """
-    Normalize RentCast listing payload into the canonical keys used by ingestion:
-      addressLine, city, state, zipCode, listPrice, propertyType
+    Normalize RentCast listing payload into canonical keys used across ingestion:
+      addressLine, city, state, zipCode,
+      listPrice, propertyType,
+      bedrooms, bathrooms, squareFeet,
+      latitude, longitude
 
-    Handles common patterns:
-      - item["address"] can be dict or string
-      - address fields might be flattened or nested
-      - list price/property type keys vary by endpoint/version
+    Why be aggressive here?
+    Because your data-quality gates + scoring depend on these fields.
     """
     address_line = ""
     city = ""
@@ -54,7 +62,6 @@ def _canonicalize_listing_payload(item: dict[str, Any]) -> dict[str, Any]:
         state = addr.get("state") or state
         zipc = addr.get("zipCode") or addr.get("zip") or addr.get("zipcode") or ""
     elif isinstance(addr, str):
-        # Sometimes formatted full address string appears here.
         address_line = addr
 
     # Fallbacks (flattened or alternative keys)
@@ -79,19 +86,37 @@ def _canonicalize_listing_payload(item: dict[str, Any]) -> dict[str, Any]:
 
     # Normalize list price field
     if "listPrice" not in payload or payload.get("listPrice") in (None, ""):
-        payload["listPrice"] = (
-            payload.get("price")
-            or payload.get("listingPrice")
-            or payload.get("list_price")
-        )
+        payload["listPrice"] = _pick(payload, ["price", "listingPrice", "list_price", "ListPrice"])
 
     # Normalize property type
     if "propertyType" not in payload or payload.get("propertyType") in (None, ""):
-        payload["propertyType"] = (
-            payload.get("property_type")
-            or payload.get("PropertyType")
-            or payload.get("type")
-        )
+        payload["propertyType"] = _pick(payload, ["property_type", "PropertyType", "type", "propertyType"])
+
+    # Normalize beds/baths/sqft — these are the fields currently missing in your quality output
+    # (your seed_demo uses bedrooms/bathrooms/squareFeet; we make RentCast match that)
+    if "bedrooms" not in payload or payload.get("bedrooms") in (None, ""):
+        payload["bedrooms"] = _pick(payload, ["bedrooms", "beds", "BedroomsTotal", "Bedrooms"])
+
+    if "bathrooms" not in payload or payload.get("bathrooms") in (None, ""):
+        payload["bathrooms"] = _pick(payload, ["bathrooms", "baths", "BathroomsTotal", "BathroomsTotalInteger"])
+
+    if "squareFeet" not in payload or payload.get("squareFeet") in (None, ""):
+        payload["squareFeet"] = _pick(payload, ["squareFeet", "sqft", "livingArea", "LivingArea"])
+
+    # Normalize lat/lon — store in both common variants to maximize compatibility
+    lat = _pick(payload, ["latitude", "lat", "Latitude"])
+    lon = _pick(payload, ["longitude", "lon", "Longitude"])
+
+    if "latitude" not in payload or payload.get("latitude") in (None, ""):
+        payload["latitude"] = lat
+    if "longitude" not in payload or payload.get("longitude") in (None, ""):
+        payload["longitude"] = lon
+
+    # Also copy into short keys some systems use
+    if "lat" not in payload or payload.get("lat") in (None, ""):
+        payload["lat"] = lat
+    if "lon" not in payload or payload.get("lon") in (None, ""):
+        payload["lon"] = lon
 
     return payload
 
@@ -122,23 +147,39 @@ class RentCastConnector:
             r.raise_for_status()
             data = r.json()
 
-        # RentCast endpoints sometimes return list; sometimes dict with "listings" or "results"
         items = data if isinstance(data, list) else data.get("listings", data.get("results", []))
 
         leads: list[RawLead] = []
-        sampled_missing = 0
+        sampled_missing_core = 0
+        sampled_missing_geo = 0
+        sampled_missing_sqft = 0
 
         for item in items:
             canon = _canonicalize_listing_payload(item)
 
-            # If still missing, snapshot a few raw items so mapping fixes are evidence-based
+            # If still missing core address fields, sample a few for debugging
             if not (canon.get("addressLine") and canon.get("city") and canon.get("zipCode")):
-                if sampled_missing < 3:
+                if sampled_missing_core < 3:
                     _write_sample(
-                        f"missing_{zipcode}_{sampled_missing}",
+                        f"missing_core_{zipcode}_{sampled_missing_core}",
                         {"raw": item, "canon": canon, "endpoint": url, "params": params},
                     )
-                    sampled_missing += 1
+                    sampled_missing_core += 1
+
+            # Optional: sample missing sqft/geo, since those are your current pain points
+            if canon.get("squareFeet") in (None, "") and sampled_missing_sqft < 2:
+                _write_sample(
+                    f"missing_sqft_{zipcode}_{sampled_missing_sqft}",
+                    {"raw": item, "canon": canon},
+                )
+                sampled_missing_sqft += 1
+
+            if (canon.get("latitude") in (None, "") or canon.get("longitude") in (None, "")) and sampled_missing_geo < 2:
+                _write_sample(
+                    f"missing_geo_{zipcode}_{sampled_missing_geo}",
+                    {"raw": item, "canon": canon},
+                )
+                sampled_missing_geo += 1
 
             leads.append(
                 RawLead(
