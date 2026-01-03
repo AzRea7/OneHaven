@@ -1,6 +1,7 @@
 import pytest
 from app.db import async_session
-from app.services.ingest import upsert_property
+from app.adapters.repos.properties import PropertyRepository
+
 
 @pytest.mark.asyncio
 async def test_upsert_property_idempotent():
@@ -16,11 +17,13 @@ async def test_upsert_property_idempotent():
     }
 
     async with async_session() as session:
-        p1 = await upsert_property(session, payload)
+        repo = PropertyRepository(session)
+        p1 = await repo.upsert_from_payload(payload)
         await session.commit()
 
     async with async_session() as session:
-        p2 = await upsert_property(session, payload)
+        repo = PropertyRepository(session)
+        p2 = await repo.upsert_from_payload(payload)
         await session.commit()
 
     assert p1 is not None

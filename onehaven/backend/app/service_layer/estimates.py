@@ -1,9 +1,8 @@
-# app/services/estimates.py
+# app/service_layer/estimates.py
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from sqlalchemy import select
@@ -16,66 +15,20 @@ from ..models import EstimateCache, EstimateKind, Property
 class EstimateResult:
     value: float | None
     source: str
-    raw: dict[str, Any] | None = None
+    raw: Any | None = None
+
+
+Fetcher = Callable[[Property], Awaitable[EstimateResult]]
 
 
 def _utcnow() -> datetime:
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
 
 
-async def get_cached_estimate(
-    session: AsyncSession,
-    *,
-    property_id: int,
-    kind: EstimateKind,
-) -> EstimateCache | None:
-    row = (
-        await session.execute(
-            select(EstimateCache)
-            .where(EstimateCache.property_id == property_id)
-            .where(EstimateCache.kind == kind)
-        )
-    ).scalars().first()
-    return row
-
-
-async def set_cached_estimate(
-    session: AsyncSession,
-    *,
-    property_id: int,
-    kind: EstimateKind,
-    value: float | None,
-    source: str,
-    ttl_days: int,
-    raw: dict[str, Any] | None,
-) -> EstimateCache:
-    now = _utcnow()
-    exp = now + timedelta(days=ttl_days)
-
-    row = await get_cached_estimate(session, property_id=property_id, kind=kind)
-    raw_json = json.dumps(raw)[:50000] if raw is not None else None
-
-    if row:
-        row.value = value
-        row.source = source
-        row.fetched_at = now
-        row.expires_at = exp
-        row.raw_json = raw_json
-        await session.flush()
-        return row
-
-    row = EstimateCache(
-        property_id=property_id,
-        kind=kind,
-        value=value,
-        source=source,
-        fetched_at=now,
-        expires_at=exp,
-        raw_json=raw_json,
-    )
-    session.add(row)
-    await session.flush()
-    return row
+def _is_fresh(row: EstimateCache, ttl_days: int) -> bool:
+    if not row.estimated_at:
+        return False
+    return row.estimated_at >= (_utcnow() - timedelta(days=ttl_days))
 
 
 async def get_or_fetch_estimate(
@@ -84,30 +37,45 @@ async def get_or_fetch_estimate(
     prop: Property,
     kind: EstimateKind,
     ttl_days: int,
-    fetcher: Callable[[Property], Awaitable[EstimateResult]],
-    force_refresh: bool = False,
-) -> EstimateResult:
+    fetcher: Fetcher,
+) -> EstimateCache:
     """
-    Central enrichment contract:
-    - property anchored
-    - TTL cached
-    - fetcher is an adapter call (RentCast today, MLS tomorrow, your ML model later)
+    Return an EstimateCache row (always).
+    If cached and fresh => return cached row.
+    Else call fetcher(prop), write/update cache row, return it.
+
+    NOTE: We cache even "None" values to avoid repeated calls.
     """
-    cached = await get_cached_estimate(session, property_id=prop.id, kind=kind)
+    q = select(EstimateCache).where(
+        EstimateCache.property_id == prop.id,
+        EstimateCache.kind == kind,
+    )
+    row = (await session.execute(q)).scalars().first()
+
+    if row and _is_fresh(row, ttl_days):
+        return row
+
+    result = await fetcher(prop)
+
     now = _utcnow()
+    if row:
+        row.value = result.value
+        row.source = result.source
+        row.raw_json = None if result.raw is None else str(result.raw)[:20000]
+        row.estimated_at = now
+        await session.flush()
+        return row
 
-    if not force_refresh and cached and cached.expires_at > now:
-        return EstimateResult(value=cached.value, source=cached.source, raw=None)
-
-    res = await fetcher(prop)
-
-    await set_cached_estimate(
-        session,
+    row = EstimateCache(
         property_id=prop.id,
         kind=kind,
-        value=res.value,
-        source=res.source,
-        ttl_days=ttl_days,
-        raw=res.raw,
+        value=result.value,
+        source=result.source,
+        raw_json=None if result.raw is None else str(result.raw)[:20000],
+        estimated_at=now,
+        created_at=now,
+        updated_at=now,
     )
-    return res
+    session.add(row)
+    await session.flush()
+    return row

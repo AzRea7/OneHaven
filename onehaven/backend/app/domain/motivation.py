@@ -1,7 +1,7 @@
 # app/domain/motivation.py
 from __future__ import annotations
 
-from ...models import Lead, Property
+from ..models import Lead, Property
 
 
 def motivation_score(prop: Property, lead: Lead) -> float:

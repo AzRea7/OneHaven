@@ -3,15 +3,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...connectors.reso_web_api import ResoWebApiClient
+from ..clients.reso_web_api import ResoWebApiClient
 from ...models import LeadSource
 from .base import IngestionProvider, RawLead
 
 
 class MlsResoProvider(IngestionProvider):
     """
-    A thin adapter that converts RESO OData Listing resources into your canonical RawLead payload.
-    Your pipeline never touches RESO directly.
+    Thin adapter: RESO OData listings -> canonical RawLead payload.
     """
 
     def __init__(self) -> None:
@@ -27,13 +26,6 @@ class MlsResoProvider(IngestionProvider):
     ) -> list[RawLead]:
         out: list[RawLead] = []
 
-        # Minimal implementation:
-        # - query listings by PostalCode (zip) OR City
-        # - return payload shaped like your pipeline expects
-        #
-        # NOTE: RESO field names vary by provider; your ResoWebApiClient should handle
-        # mapping or pass through standard names where possible.
-
         if city:
             rows = await self._client.query_listings(city=city, top=per_zip_limit)
             out.extend(self._rows_to_raw(rows))
@@ -48,7 +40,6 @@ class MlsResoProvider(IngestionProvider):
     def _rows_to_raw(self, rows: list[dict[str, Any]]) -> list[RawLead]:
         out: list[RawLead] = []
         for r in rows:
-            # You want your internal payload keys to stay stable:
             payload = {
                 "addressLine": r.get("UnparsedAddress") or r.get("StreetAddress") or r.get("AddressLine1"),
                 "city": r.get("City"),

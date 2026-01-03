@@ -3,8 +3,8 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import EstimateKind
-from onehaven.backend.app.service_layer.estimates import get_or_fetch_estimate
-from onehaven.backend.app.adapters.clients.rentcast_avm import fetch_rent_long_term
+from app.service_layer.estimates import get_or_fetch_estimate
+from app.adapters.clients.rentcast_avm import fetch_rent_long_term
 
 
 @pytest.mark.asyncio

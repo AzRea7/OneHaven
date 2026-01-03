@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean,
@@ -13,8 +13,12 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Column,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class Base(DeclarativeBase):
@@ -106,7 +110,8 @@ class Property(Base):
     last_sale_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_sale_price: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
 
 
 class Lead(Base):
@@ -138,8 +143,8 @@ class Lead(Base):
     score_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     explain_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class OutcomeEvent(Base):
@@ -193,8 +198,8 @@ class OutboxEvent(Base):
 
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class EstimateCache(Base):
@@ -213,10 +218,19 @@ class EstimateCache(Base):
     value: Mapped[float | None] = mapped_column(Float, nullable=True)
     source: Mapped[str] = mapped_column(String(40), default="unknown")
 
-    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    # semantic timestamp (when the estimate is “as-of”)
+    estimated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+    # operational timestamp (when we fetched/wrote it)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
     raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # your service code is passing this (per the failure)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 
 
 class JobRun(Base):

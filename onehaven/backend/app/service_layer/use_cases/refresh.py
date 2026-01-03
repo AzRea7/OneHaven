@@ -8,10 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...config import settings
 from ...models import LeadSource, Strategy, EstimateKind
-from ...services.ingest import upsert_property, create_or_update_lead, score_lead
 from ...domain.normalize import is_disallowed_type
-from ..estimates import get_or_fetch_estimate
-from ...adapters.clients.rentcast_avm import fetch_rent_long_term, fetch_value
+
+from ..estimates import get_or_fetch_estimate, EstimateResult
+from ..scoring import score_lead
+
+from ...adapters.repos.properties import PropertyRepository
+from ...adapters.repos.leads import LeadRepository
 
 from ...adapters.ingestion.base import IngestionProvider, RawLead
 from ...adapters.ingestion.rentcast_listings import RentCastListingsProvider
@@ -26,6 +29,8 @@ SE_MICHIGAN_ZIPS = [
 
 
 def _coerce_float(x: Any) -> float | None:
+    if x is None:
+        return None
     try:
         return float(x)
     except Exception:
@@ -33,14 +38,39 @@ def _coerce_float(x: Any) -> float | None:
 
 
 def _missing_core_fields(payload: dict[str, Any]) -> bool:
+    # strict: canonical identity fields must exist
     return not all(payload.get(k) for k in ("addressLine", "city", "state", "zipCode"))
 
 
 def _provider() -> IngestionProvider:
-    # Feature-flagged ingestion. Pipeline stays identical.
+    """
+    Feature-flagged ingestion. The refresh pipeline does not care
+    whether listings come from RentCast, MLS RESO, or future sources.
+    """
     if settings.INGESTION_SOURCE == "mls_reso":
         return MlsResoProvider()
     return RentCastListingsProvider()
+
+
+# -------------------------------------------------------------------
+# Module-level fetchers (IMPORTANT: tests monkeypatch these symbols)
+# -------------------------------------------------------------------
+async def fetch_value(prop) -> EstimateResult:
+    """
+    Fetch value estimate (AVM).
+    Tests will monkeypatch refresh_uc.fetch_value to force deterministic behavior.
+    """
+    from ...adapters.clients.rentcast_avm import fetch_value_avm
+    return await fetch_value_avm(prop)
+
+
+async def fetch_rent_long_term(prop) -> EstimateResult:
+    """
+    Fetch long-term rent estimate (AVM).
+    Tests will monkeypatch refresh_uc.fetch_rent_long_term to force deterministic behavior.
+    """
+    from ...adapters.clients.rentcast_avm import fetch_rent_long_term_avm
+    return await fetch_rent_long_term_avm(prop)
 
 
 async def refresh_region_use_case(
@@ -56,18 +86,21 @@ async def refresh_region_use_case(
     ttl_days_value: int = 60,
 ) -> dict[str, Any]:
     """
-    Canonical 3-phase refresh (industry-standard orchestration point):
-      1) ingest   -> create/update Property + Lead
-      2) enrich   -> rent/value AVM via EstimateCache (property-anchored)
-      3) score    -> deterministic scoring, gated on rent for rentals
+    Canonical 3-phase refresh:
+      1) ingest   -> normalize -> upsert property + lead (sale truth only)
+      2) enrich   -> rent/value via EstimateCache (property anchored)
+      3) score    -> deterministic scoring; rentals hard-gated on rent
 
-    IMPORTANT: scoring never calls external APIs directly.
+    External APIs only happen in Phase 2.
     """
     drop_reasons: dict[str, int] = defaultdict(int)
     target_zips = zips or SE_MICHIGAN_ZIPS
 
     created = updated = dropped = 0
     provider = _provider()
+
+    prop_repo = PropertyRepository(session)
+    lead_repo = LeadRepository(session)
 
     # -------------------------
     # Phase 1: INGEST
@@ -95,7 +128,7 @@ async def refresh_region_use_case(
             drop_reasons["missing_price"] += 1
             continue
 
-        if max_price and lp > max_price:
+        if max_price is not None and lp > max_price:
             dropped += 1
             drop_reasons["over_max_price"] += 1
             continue
@@ -111,14 +144,15 @@ async def refresh_region_use_case(
                 drop_reasons[f"norm_type::{norm_type}"] += 1
             continue
 
-        prop = await upsert_property(session, payload)
+        # Property identity anchor
+        prop = await prop_repo.upsert_from_payload(payload)
 
-        lead, was_created = await create_or_update_lead(
-            session,
+        # Lead is sale-truth only at ingest: enrichment owns rent/value
+        lead, was_created = await lead_repo.upsert(
             prop=prop,
             strategy=strategy,
             source=rl.source or LeadSource.rentcast_listing,
-            source_ref=rl.source_ref or "",
+            source_ref=rl.source_ref or None,
             list_price=lp,
             rent_estimate=None,
             provenance=payload,
@@ -129,32 +163,32 @@ async def refresh_region_use_case(
         ingested.append((lead, prop))
 
     # -------------------------
-    # Phase 2: ENRICH
+    # Phase 2: ENRICH (cached)
     # -------------------------
     for lead, prop in ingested:
-        v = await get_or_fetch_estimate(
+        value_row = await get_or_fetch_estimate(
             session,
             prop=prop,
             kind=EstimateKind.value,
             ttl_days=ttl_days_value,
-            fetcher=lambda p: fetch_value(p),
+            fetcher=fetch_value,  # module-level symbol (monkeypatchable)
         )
-        if v.value is not None:
-            lead.arv_estimate = float(v.value)
+        if value_row.value is not None:
+            lead.arv_estimate = float(value_row.value)
 
         if lead.strategy == Strategy.rental:
-            r = await get_or_fetch_estimate(
+            rent_row = await get_or_fetch_estimate(
                 session,
                 prop=prop,
                 kind=EstimateKind.rent_long_term,
                 ttl_days=ttl_days_rent,
-                fetcher=lambda p: fetch_rent_long_term(p),
+                fetcher=fetch_rent_long_term,  # module-level symbol (monkeypatchable)
             )
-            if r.value is not None:
-                lead.rent_estimate = float(r.value)
+            if rent_row.value is not None:
+                lead.rent_estimate = float(rent_row.value)
 
     # -------------------------
-    # Phase 3: SCORE (hard gated)
+    # Phase 3: SCORE (hard gate)
     # -------------------------
     for lead, prop in ingested:
         if lead.strategy == Strategy.rental and lead.rent_estimate is None:
