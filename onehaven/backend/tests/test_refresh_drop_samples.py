@@ -2,7 +2,7 @@ import os
 import pytest
 
 from app.jobs.refresh import _missing_core_fields
-from app.connectors import rentcast as rc
+from onehaven.backend.app.adapters.clients import rentcast_listings as rc
 
 def test_missing_core_fields_detection():
     assert _missing_core_fields({"addressLine": "", "city": "", "zipCode": ""}) is True

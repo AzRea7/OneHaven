@@ -5,9 +5,9 @@ from typing import Any
 
 import httpx
 
-from ..config import settings
-from ..models import Property
-from ..services.estimates import EstimateResult
+from ...config import settings
+from ...models import Property
+from ...services.estimates import EstimateResult
 
 
 def _addr_string(prop: Property) -> str:

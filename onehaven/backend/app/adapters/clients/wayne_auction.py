@@ -14,7 +14,7 @@ import certifi
 import httpx
 from bs4 import BeautifulSoup
 
-from ..config import settings
+from ...config import settings
 from .base import RawLead
 
 BASE = "https://waynecountytreasurermi.com/"

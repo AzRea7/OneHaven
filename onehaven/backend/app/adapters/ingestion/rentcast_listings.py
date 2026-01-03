@@ -1,0 +1,31 @@
+# app/adapters/ingestion/rentcast_listings.py
+from __future__ import annotations
+
+from ..clients.rentcast_listings import RentCastConnector
+from ...models import LeadSource
+from .base import IngestionProvider, RawLead
+
+
+class RentCastListingsProvider(IngestionProvider):
+    def __init__(self) -> None:
+        self._rc = RentCastConnector()
+
+    async def fetch(
+        self,
+        *,
+        region: str | None,
+        zips: list[str],
+        city: str | None,
+        per_zip_limit: int,
+    ) -> list[RawLead]:
+        # RentCast connector is zip-driven; ignore city for now.
+        out: list[RawLead] = []
+
+        for zipcode in zips:
+            raw = await self._rc.fetch_listings(zipcode, limit=per_zip_limit)
+            for rl in raw:
+                payload = rl.payload or {}
+                source_ref = str(payload.get("id") or payload.get("listingId") or "")
+                out.append(RawLead(payload=payload, source=LeadSource.rentcast_listing, source_ref=source_ref))
+
+        return out

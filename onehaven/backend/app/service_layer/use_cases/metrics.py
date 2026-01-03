@@ -9,7 +9,7 @@ from typing import Iterable
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Lead, OutcomeEvent, OutcomeType, Property
+from ...models import Lead, OutcomeEvent, OutcomeType, Property
 
 # Stage order used for "reached stage" logic.
 _STAGE: dict[OutcomeType, int] = {

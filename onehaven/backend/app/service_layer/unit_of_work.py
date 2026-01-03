@@ -5,7 +5,7 @@ from typing import Protocol
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import async_session
-from ..adapters.sqlalchemy_repos import SqlAlchemyRepos
+from ..adapters.repos.sqlalchemy_repos import SqlAlchemyRepos
 
 
 class UnitOfWork(Protocol):

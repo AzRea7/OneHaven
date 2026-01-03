@@ -5,7 +5,7 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Property, Lead, EstimateCache, EstimateKind, Strategy
+from ...models import Property, Lead, EstimateCache, EstimateKind, Strategy
 
 
 class SqlAlchemyRepos:
@@ -24,11 +24,11 @@ class SqlAlchemyRepos:
 
     async def upsert_property(self, payload: dict) -> Property:
         # reuse your existing service function for now, but behind repo seam
-        from ..services.ingest import upsert_property as _upsert_property
+        from ...services.ingest import upsert_property as _upsert_property
         return await _upsert_property(self.session, payload)
 
     async def upsert_lead(self, *, prop: Property, payload: dict, strategy: Strategy) -> Lead:
-        from ..services.ingest import create_or_update_lead as _upsert_lead
+        from ...services.ingest import create_or_update_lead as _upsert_lead
         lead, _ = await _upsert_lead(
             self.session,
             prop=prop,

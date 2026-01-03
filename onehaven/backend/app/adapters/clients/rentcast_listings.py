@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from .base import RawLead
-from ..config import settings
+from ...config import settings
 
 
 def _write_sample(name: str, obj: dict, max_bytes: int = 200_000) -> None:

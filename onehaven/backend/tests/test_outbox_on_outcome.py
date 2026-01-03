@@ -4,7 +4,7 @@ from sqlalchemy import select
 from app.db import async_session, engine
 from app.models import Base, OutboxEvent, LeadSource, Strategy
 from app.services.ingest import upsert_property, create_or_update_lead, score_lead
-from app.services.outcomes import update_lead_status
+from onehaven.backend.app.service_layer.use_cases.outcomes import update_lead_status
 from app.models import LeadStatus
 
 @pytest.mark.asyncio
