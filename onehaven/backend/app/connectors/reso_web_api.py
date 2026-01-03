@@ -47,6 +47,45 @@ class ResoWebApiClient:
         if not self._token:
             await self._get_token()
         return {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
+    
+    
+    async def query_listings(
+        self,
+        *,
+        zipcode: str,
+        top: int = 200,
+        max_price: float | None = None,
+        city: str | None = None,
+    ) -> list[dict[str, Any]]:
+        token = await self._get_token()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        # RESO OData: $filter syntax varies a bit by implementation; this is typical.
+        filters = [f"PostalCode eq '{zipcode}'"]
+        if city:
+            filters.append(f"City eq '{city}'")
+        if max_price:
+            filters.append(f"ListPrice le {float(max_price)}")
+
+        params = {
+            "$top": str(int(top)),
+            "$orderby": "ModificationTimestamp desc",
+            "$filter": " and ".join(filters),
+        }
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(self.cfg.base_url.rstrip("/") + "/Property", headers=headers, params=params)
+            r.raise_for_status()
+            data = r.json()
+
+        # MLS Grid/RESO often uses {"value": [...]} shape
+        rows = data.get("value")
+        if isinstance(rows, list):
+            return [x for x in rows if isinstance(x, dict)]
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        return []
+
 
     async def query_property(self, odata_query: str) -> dict[str, Any]:
         """

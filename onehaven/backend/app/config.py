@@ -44,6 +44,7 @@ class Settings(BaseSettings):
 
     # Optional: if you have a custom CA bundle path (rare on Windows corp setups)
     WAYNE_CA_BUNDLE: str | None = None
+    INGESTION_SOURCE: str = "rentcast"  # rentcast | mls_reso
 
 
 
