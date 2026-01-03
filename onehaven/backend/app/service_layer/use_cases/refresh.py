@@ -60,8 +60,8 @@ async def fetch_value(prop) -> EstimateResult:
     Fetch value estimate (AVM).
     Tests will monkeypatch refresh_uc.fetch_value to force deterministic behavior.
     """
-    from ...adapters.clients.rentcast_avm import fetch_value_avm
-    return await fetch_value_avm(prop)
+    from ...adapters.clients.rentcast_avm import fetch_value
+    return await fetch_value(prop)
 
 
 async def fetch_rent_long_term(prop) -> EstimateResult:

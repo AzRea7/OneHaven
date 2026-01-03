@@ -2,74 +2,101 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from typing import Any
+from typing import Optional, Tuple, Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ...models import Lead, LeadSource, LeadStatus, Property, Strategy
+from ...models import Lead, LeadStatus, Strategy, Property
 
 
 class LeadRepository:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession):
         self.session = session
 
     async def upsert(
         self,
         *,
-        prop: Property,
+        # Accept either prop=Property or property_id=int
+        prop: Optional[Property] = None,
+        property_id: Optional[int] = None,
         strategy: Strategy,
-        source: LeadSource,
-        source_ref: str | None,
-        list_price: float | None,
-        rent_estimate: float | None,
-        provenance: dict[str, Any] | None = None,
-    ) -> tuple[Lead, bool]:
+        list_price: Optional[float] = None,
+        max_price_rule: Optional[float] = None,
+        score: Optional[float] = None,
+        status: Optional[LeadStatus] = None,
+        reasons_json: Optional[str] = None,
+        raw_json: Optional[str] = None,
+        # provenance fields that callers may send (even if DB doesn't have columns)
+        source: Optional[str] = None,
+        source_ref: Optional[str] = None,
+        **_extra: Any,  # swallow unexpected kwargs from newer call sites
+    ) -> Tuple[Lead, bool]:
         """
-        Upsert a lead by (property_id, strategy, source).
+        Upsert a Lead.
+
+        Compatibility layer:
+        - Some callers pass prop=<Property>
+        - Others pass property_id=<int>
+        - Some pass source/source_ref even though Lead table has no such columns.
+
+        Natural key used: (property_id, strategy)
         """
+
+        if property_id is None:
+            if prop is None:
+                raise TypeError("LeadRepository.upsert requires either property_id=... or prop=...")
+            if getattr(prop, "id", None) is None:
+                raise ValueError("prop.id is None; make sure the property was flushed/inserted before upserting leads")
+            property_id = int(prop.id)
+
         q = select(Lead).where(
-            Lead.property_id == prop.id,
+            Lead.property_id == property_id,
             Lead.strategy == strategy,
-            Lead.source == source,
         )
-        existing = (await self.session.execute(q)).scalars().first()
+        lead = (await self.session.execute(q)).scalars().first()
 
-        prov_json = None
-        if provenance is not None:
+        was_created = False
+        if lead is None:
+            lead = Lead(property_id=property_id, strategy=strategy)
+            self.session.add(lead)
+            was_created = True
+
+        # Update numeric/business fields
+        if list_price is not None:
+            lead.list_price = float(list_price)
+        if max_price_rule is not None:
+            lead.max_price_rule = float(max_price_rule)
+        if score is not None:
+            lead.score = float(score)
+        if status is not None:
+            lead.status = status
+        if reasons_json is not None:
+            lead.reasons_json = reasons_json
+
+        # Raw payload (plus provenance) — because DB doesn't have dedicated columns
+        if raw_json is not None:
+            lead.raw_json = raw_json
+
+        # If we still don't have raw_json, but we have provenance, store it minimally.
+        if (lead.raw_json is None or lead.raw_json == "") and (source or source_ref):
+            lead.raw_json = json.dumps(
+                {"source": source, "source_ref": source_ref},
+                ensure_ascii=False,
+            )
+        elif (source or source_ref) and lead.raw_json:
+            # Try to merge provenance into existing raw_json (best effort).
             try:
-                prov_json = json.dumps(provenance)[:20000]
+                data = json.loads(lead.raw_json)
+                if isinstance(data, dict):
+                    if source is not None:
+                        data.setdefault("source", source)
+                    if source_ref is not None:
+                        data.setdefault("source_ref", source_ref)
+                    lead.raw_json = json.dumps(data, ensure_ascii=False)
             except Exception:
-                prov_json = None
+                # If raw_json isn't valid JSON, don't break refresh; just leave it.
+                pass
 
-        if existing:
-            existing.source_ref = source_ref or existing.source_ref
-            existing.list_price = list_price if list_price is not None else existing.list_price
-            existing.rent_estimate = rent_estimate if rent_estimate is not None else existing.rent_estimate
-            existing.updated_at = datetime.utcnow()
-            if hasattr(existing, "score_json") and prov_json is not None:
-                existing.score_json = prov_json
-            await self.session.flush()
-            return existing, False
-
-        lead = Lead(
-            property_id=prop.id,
-            strategy=strategy,
-            source=source,
-            source_ref=source_ref,
-            list_price=list_price,
-            rent_estimate=rent_estimate,
-            status=LeadStatus.new,
-            deal_score=0.0,
-            motivation_score=0.0,
-            rank_score=0.0,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-        )
-        if hasattr(lead, "score_json") and prov_json is not None:
-            lead.score_json = prov_json
-
-        self.session.add(lead)
         await self.session.flush()
-        return lead, True
+        return lead, was_created

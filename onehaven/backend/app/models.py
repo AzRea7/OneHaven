@@ -1,8 +1,9 @@
 # app/models.py
 from __future__ import annotations
 
-import enum
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from enum import Enum as PyEnum
+from typing import Optional
 
 from sqlalchemy import (
     Boolean,
@@ -13,9 +14,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
-    Column,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -28,7 +29,7 @@ class Base(DeclarativeBase):
 # -----------------------------
 # Core enums
 # -----------------------------
-class LeadStatus(str, enum.Enum):
+class LeadStatus(str, PyEnum):
     new = "new"
     qualified = "qualified"
     contacted = "contacted"
@@ -37,19 +38,19 @@ class LeadStatus(str, enum.Enum):
     dead = "dead"
 
 
-class LeadSource(str, enum.Enum):
+class LeadSource(str, PyEnum):
     rentcast_listing = "rentcast_listing"
     wayne_auction = "wayne_auction"
     manual = "manual"
     mls_reso = "mls_reso"
 
 
-class Strategy(str, enum.Enum):
+class Strategy(str, PyEnum):
     rental = "rental"
     flip = "flip"
 
 
-class OutcomeType(str, enum.Enum):
+class OutcomeType(str, PyEnum):
     contacted = "contacted"
     responded = "responded"
     appointment_set = "appointment_set"
@@ -60,88 +61,98 @@ class OutcomeType(str, enum.Enum):
     mls_closed = "mls_closed"
 
 
-class OutboxStatus(str, enum.Enum):
+class OutboxStatus(str, PyEnum):
     pending = "pending"
     delivered = "delivered"
     failed = "failed"
 
 
-class IntegrationType(str, enum.Enum):
+class IntegrationType(str, PyEnum):
     webhook = "webhook"
 
 
-class JobRunStatus(str, enum.Enum):
+class JobRunStatus(str, PyEnum):
     running = "running"
     success = "success"
     failed = "failed"
 
-class EstimateKind(str, enum.Enum):
+
+class EstimateKind(str, PyEnum):
     rent_long_term = "rent_long_term"
     value = "value"
+
 
 # -----------------------------
 # Models
 # -----------------------------
-
 class Property(Base):
+    """
+    IMPORTANT: This model is mapped to your *current* SQLite schema.
+
+    Your DB table `properties` has columns:
+      address_line, city, state, zipcode, lat, lon, property_type, beds, baths, sqft,
+      owner_name, owner_mailing, last_sale_date, last_sale_price, created_at,
+      source, source_listing_id
+
+    So we keep the *Python attribute names* your code prefers (address_line1, zip_code, etc.)
+    but map them onto the existing column names using mapped_column("<db_column_name>", ...).
+    """
     __tablename__ = "properties"
-    __table_args__ = (
-        UniqueConstraint("address_line", "city", "state", "zipcode", name="uq_property_addr"),
-    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    address_line: Mapped[str] = mapped_column(String(255))
-    city: Mapped[str] = mapped_column(String(80))
-    state: Mapped[str] = mapped_column(String(2))
-    zipcode: Mapped[str] = mapped_column(String(10))
+    # These two exist in DB (you confirmed via PRAGMA)
+    source: Mapped[str] = mapped_column(String, default="unknown", nullable=False)
+    source_listing_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
-    lat: Mapped[float | None] = mapped_column(Float, nullable=True)
-    lon: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # DB column is `address_line` (NOT NULL)
+    address_line1: Mapped[str] = mapped_column("address_line", String(255), nullable=False)
 
-    property_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    beds: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    baths: Mapped[float | None] = mapped_column(Float, nullable=True)
-    sqft: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # DB has no address_line2 column
+    city: Mapped[str] = mapped_column(String(80), nullable=False)
+    state: Mapped[str] = mapped_column(String(2), nullable=False)
 
-    owner_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    owner_mailing: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # DB column is `zipcode` (NOT NULL)
+    zip_code: Mapped[str] = mapped_column("zipcode", String(10), nullable=False)
 
-    last_sale_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_sale_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # DB columns are `lat` / `lon`
+    latitude: Mapped[Optional[float]] = mapped_column("lat", Float, nullable=True)
+    longitude: Mapped[Optional[float]] = mapped_column("lon", Float, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    property_type: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
 
+    # DB columns are `beds` / `baths`
+    bedrooms: Mapped[Optional[int]] = mapped_column("beds", Integer, nullable=True)
+    bathrooms: Mapped[Optional[float]] = mapped_column("baths", Float, nullable=True)
+
+    sqft: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # extra columns in your DB (fine to keep)
+    owner_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    owner_mailing: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    last_sale_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_sale_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # DB has created_at (NOT NULL). DB does NOT have updated_at.
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class Lead(Base):
     __tablename__ = "leads"
-    __table_args__ = (
-        UniqueConstraint("property_id", "strategy", "source", name="uq_lead_prop_strategy_source"),
-    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
     property_id: Mapped[int] = mapped_column(Integer, index=True)
-
     strategy: Mapped[Strategy] = mapped_column(Enum(Strategy), index=True)
-    source: Mapped[LeadSource] = mapped_column(Enum(LeadSource), index=True)
 
-    source_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    list_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_price_rule: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
-    # Truthy inputs / enrichment outputs
-    list_price: Mapped[float | None] = mapped_column(Float, nullable=True)
-    rent_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)
-    arv_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)  # NEW
-    rehab_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)  # optional
-
-    deal_score: Mapped[float] = mapped_column(Float, default=0.0)
-    motivation_score: Mapped[float] = mapped_column(Float, default=0.0)
-    rank_score: Mapped[float] = mapped_column(Float, default=0.0)
-
+    score: Mapped[Optional[float]] = mapped_column(Float, nullable=True, index=True)
     status: Mapped[LeadStatus] = mapped_column(Enum(LeadStatus), default=LeadStatus.new, index=True)
 
-    score_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    explain_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reasons_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    raw_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -154,7 +165,7 @@ class OutcomeEvent(Base):
     lead_id: Mapped[int] = mapped_column(Integer, index=True)
 
     outcome_type: Mapped[OutcomeType] = mapped_column(Enum(OutcomeType), index=True)
-    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
     source: Mapped[str] = mapped_column(String(50), default="manual")
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -173,28 +184,22 @@ class Integration(Base):
 
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     config_json: Mapped[str] = mapped_column(Text, default="{}")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class OutboxEvent(Base):
-    """
-    Outbox pattern (reliable integration events).
-    IMPORTANT: fields must match integrations/services/outbox.py
-    """
     __tablename__ = "outbox_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    # what happened
     event_type: Mapped[str] = mapped_column(String(120), index=True)
     payload_json: Mapped[str] = mapped_column(Text)
 
-    # delivery bookkeeping
     status: Mapped[OutboxStatus] = mapped_column(Enum(OutboxStatus), default=OutboxStatus.pending, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
 
-    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
-    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -204,29 +209,35 @@ class OutboxEvent(Base):
 
 class EstimateCache(Base):
     """
-    Hard cache for external enrichment calls.
-    Keyed by (property_id, kind).
+    IMPORTANT: This model is mapped to your *current* SQLite schema.
+
+    estimate_cache columns from PRAGMA:
+      id, property_id, kind, value, source, fetched_at (NOT NULL), expires_at (NOT NULL),
+      raw_json, created_at(TEXT default), updated_at(TEXT default), estimated_at
     """
     __tablename__ = "estimate_cache"
     __table_args__ = (UniqueConstraint("property_id", "kind", name="uq_estimate_cache_prop_kind"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    property_id: Mapped[int] = mapped_column(Integer, index=True)
-    kind: Mapped[EstimateKind] = mapped_column(Enum(EstimateKind), index=True)
+    property_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    kind: Mapped[EstimateKind] = mapped_column(Enum(EstimateKind), nullable=False, index=True)
 
-    # the numeric estimate (rent, value, etc.)
-    value: Mapped[float | None] = mapped_column(Float, nullable=True)
-    source: Mapped[str] = mapped_column(String(40), default="unknown")
+    value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    source: Mapped[str] = mapped_column(String(40), nullable=False, default="unknown")
 
-    # bookkeeping timestamps
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Required in DB
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=lambda: utcnow() + timedelta(days=1))
 
-    # when the estimate was produced (used for TTL freshness checks)
-    estimated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    raw_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # DB has these as TEXT defaults; we map them as strings to avoid sqlite/type weirdness
+    created_at: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    estimated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
 
 class JobRun(Base):
     __tablename__ = "job_runs"
@@ -236,9 +247,7 @@ class JobRun(Base):
 
     status: Mapped[JobRunStatus] = mapped_column(Enum(JobRunStatus), default=JobRunStatus.running, index=True)
 
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    meta_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
