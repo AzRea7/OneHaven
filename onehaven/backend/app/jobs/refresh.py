@@ -1,3 +1,4 @@
+# app/jobs/refresh.py
 from __future__ import annotations
 
 from collections import defaultdict
@@ -6,11 +7,11 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..connectors.rentcast import RentCastConnector
-from ..connectors.wayne_auction import WayneAuctionConnector
-from ..models import LeadSource, Strategy
+from ..models import LeadSource, Strategy, EstimateKind
 from ..services.ingest import upsert_property, create_or_update_lead, score_lead
 from ..services.normalize import is_disallowed_type
-from ..services.rent_estimator import fetch_rent_estimate
+from ..services.estimates import get_or_fetch_estimate
+from ..adapters.rentcast_avm import fetch_rent_long_term, fetch_value
 
 
 SE_MICHIGAN_ZIPS = [
@@ -28,10 +29,7 @@ def _coerce_float(x: Any) -> float | None:
 
 
 def _missing_core_fields(payload: dict[str, Any]) -> bool:
-    return not all(
-        payload.get(k)
-        for k in ("addressLine", "city", "state", "zipCode")
-    )
+    return not all(payload.get(k) for k in ("addressLine", "city", "state", "zipCode"))
 
 
 async def refresh_region(
@@ -42,16 +40,29 @@ async def refresh_region(
     city: str | None = None,
     max_price: float | None = None,
     per_zip_limit: int = 200,
+    strategy: Strategy = Strategy.rental,
+    ttl_days_rent: int = 45,
+    ttl_days_value: int = 60,
 ) -> dict[str, Any]:
+    """
+    3-phase refresh:
+      1) ingest (sale listings only)
+      2) enrich (rent/value via property-anchored cache)
+      3) score (requires enrichment for rental)
 
+    NOTE: city parameter is reserved for MLS/RESO later. RentCast connector is zip-driven.
+    """
     drop_reasons: dict[str, int] = defaultdict(int)
-
     target_zips = zips or SE_MICHIGAN_ZIPS
 
     created = updated = dropped = 0
 
     rc = RentCastConnector()
-    _wayne = WayneAuctionConnector()
+
+    # -------------------------
+    # Phase 1: INGEST
+    # -------------------------
+    ingested: list[tuple[Any, Any]] = []  # (lead, prop)
 
     for zipcode in target_zips:
         try:
@@ -80,40 +91,75 @@ async def refresh_region(
                 continue
 
             raw_type = payload.get("propertyType")
-            disallowed, _, _ = is_disallowed_type(raw_type)
+            disallowed, norm_type, reason_key = is_disallowed_type(raw_type)
             if disallowed:
                 dropped += 1
                 drop_reasons["disallowed_type"] += 1
+                if reason_key:
+                    drop_reasons[reason_key] += 1
+                if norm_type:
+                    drop_reasons[f"norm_type::{norm_type}"] += 1
                 continue
-
-            # ---- RENT ESTIMATE (CORRECT ENDPOINT)
-            addr = f"{payload['addressLine']}, {payload['city']}, {payload['state']}, {payload['zipCode']}"
-
-            rent_f = await fetch_rent_estimate(
-                address=addr,
-                property_type=payload.get("propertyType"),
-                bedrooms=_coerce_float(payload.get("bedrooms")),
-                bathrooms=_coerce_float(payload.get("bathrooms")),
-                square_feet=_coerce_float(payload.get("squareFeet")),
-            )
 
             prop = await upsert_property(session, payload)
 
             lead, was_created = await create_or_update_lead(
                 session,
                 prop=prop,
-                strategy=Strategy.rental,
+                strategy=strategy,
                 source=LeadSource.rentcast_listing,
-                source_ref=str(payload.get("id")),
+                source_ref=str(payload.get("id") or payload.get("listingId") or ""),
                 list_price=lp,
-                rent_estimate=rent_f,
+                rent_estimate=None,  # set in enrichment phase
                 provenance=payload,
             )
 
             created += int(was_created)
             updated += int(not was_created)
 
-            await score_lead(session, lead, prop, is_auction=False)
+            ingested.append((lead, prop))
+
+    # -------------------------
+    # Phase 2: ENRICH (cached)
+    # -------------------------
+    for lead, prop in ingested:
+        # value (ARV-ish) for both strategies
+        v = await get_or_fetch_estimate(
+            session,
+            prop=prop,
+            kind=EstimateKind.value,
+            ttl_days=ttl_days_value,
+            fetcher=lambda p: fetch_value(p),
+        )
+        if v.value is not None:
+            lead.arv_estimate = float(v.value)
+
+        # rent only required for rental
+        if lead.strategy == Strategy.rental:
+            r = await get_or_fetch_estimate(
+                session,
+                prop=prop,
+                kind=EstimateKind.rent_long_term,
+                ttl_days=ttl_days_rent,
+                fetcher=lambda p: fetch_rent_long_term(p),
+            )
+            if r.value is not None:
+                lead.rent_estimate = float(r.value)
+
+    # -------------------------
+    # Phase 3: SCORE (gated)
+    # -------------------------
+    for lead, prop in ingested:
+        if lead.strategy == Strategy.rental and lead.rent_estimate is None:
+            # non-negotiable: rental scoring without rent is theater
+            drop_reasons["missing_rent_enrichment"] += 1
+            lead.deal_score = 0.0
+            lead.motivation_score = 0.0
+            lead.rank_score = 0.0
+            lead.explain_json = "blocked: missing rent_estimate (rental strategy)"
+            continue
+
+        await score_lead(session, lead, prop, is_auction=False)
 
     return {
         "created_leads": created,
@@ -121,4 +167,6 @@ async def refresh_region(
         "dropped": dropped,
         "drop_reasons": dict(drop_reasons),
         "target_zips": target_zips,
+        "strategy": strategy.value,
+        "phases": {"ingested": len(ingested), "enriched": len(ingested), "scored": len(ingested)},
     }

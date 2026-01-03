@@ -216,7 +216,7 @@ async def top_leads(
                 rank_score=lead.rank_score,
                 deal_score=lead.deal_score,
                 motivation_score=lead.motivation_score,
-                explain=lead.explain,
+                explain=lead.explain_json or "",
                 address_line=prop.address_line,
                 city=prop.city,
                 state=prop.state,

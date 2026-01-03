@@ -1,4 +1,4 @@
-# backend/app/services/ingest.py
+# app/services/ingest.py
 from __future__ import annotations
 
 import inspect
@@ -94,6 +94,7 @@ def _normalize_address_fields(payload: dict[str, Any]) -> dict[str, Any]:
         out["zipCode"] = str(zipc).strip()
 
     return out
+
 
 
 async def upsert_property(session: AsyncSession, payload: dict[str, Any]) -> Property:
@@ -228,22 +229,14 @@ async def create_or_update_lead(
 
 
 def _call_motivation_score(prop: Property, lead: Lead) -> float:
-    """
-    Your motivation scorer signature changed while refactoring.
-    This wrapper calls it safely no matter if it's:
-      motivation_score(prop)
-      motivation_score(lead, prop)
-      motivation_score(lead=..., prop=...)
-    """
     try:
-        from ..scoring.motivation import motivation_score  # local import to avoid cycles
+        from ..scoring.motivation import motivation_score
     except Exception:
         return 0.2
 
     try:
         sig = inspect.signature(motivation_score)
     except Exception:
-        # best effort
         try:
             return float(motivation_score(prop))  # type: ignore
         except Exception:
@@ -263,17 +256,25 @@ def _call_motivation_score(prop: Property, lead: Lead) -> float:
 async def score_lead(session: AsyncSession, lead: Lead, prop: Property, **kwargs: Any) -> None:
     """
     Score lead using current scoring modules.
-    Accepts extra kwargs (is_auction, etc.) for backwards compatibility.
+    IMPORTANT: uses enriched lead.arv_estimate when present, otherwise heuristic.
     """
-    # Deal side
-    arv = estimate_arv(lead.list_price)
+    # Prefer enriched value estimate
+    arv = lead.arv_estimate if lead.arv_estimate is not None else estimate_arv(lead.list_price)
+
     rehab = estimate_rehab(prop.sqft)
-    dscore = float(deal_score(lead.list_price, arv, rehab, lead.rent_estimate, strategy=str(lead.strategy.value)))
+    lead.rehab_estimate = rehab
 
-    # Motivation side (safe wrapper across signature changes)
+    dscore = float(
+        deal_score(
+            lead.list_price,
+            arv,
+            rehab,
+            lead.rent_estimate,
+            strategy=str(lead.strategy.value),
+        )
+    )
+
     mscore = float(_call_motivation_score(prop, lead))
-
-    # Rank
     rscore = float(rank_score(dscore, mscore, strategy=str(lead.strategy.value)))
 
     lead.deal_score = dscore
@@ -281,7 +282,6 @@ async def score_lead(session: AsyncSession, lead: Lead, prop: Property, **kwargs
     lead.rank_score = rscore
     lead.updated_at = datetime.utcnow()
 
-    # Explanation: compact but information-dense
     drivers = {
         "gross_yield": None,
         "dscr_proxy": None,
@@ -311,7 +311,5 @@ async def score_lead(session: AsyncSession, lead: Lead, prop: Property, **kwargs
     except Exception:
         ex = f"deal={dscore:.2f} | motivation={mscore:.2f}"
 
-    if hasattr(lead, "explain_json"):
-        lead.explain_json = ex
-
+    lead.explain_json = ex
     await session.flush()

@@ -34,10 +34,10 @@ class LeadStatus(str, enum.Enum):
 
 
 class LeadSource(str, enum.Enum):
-    # app.main imports this; keep stable
     rentcast_listing = "rentcast_listing"
     wayne_auction = "wayne_auction"
     manual = "manual"
+    mls_reso = "mls_reso"
 
 
 class Strategy(str, enum.Enum):
@@ -71,10 +71,14 @@ class JobRunStatus(str, enum.Enum):
     success = "success"
     failed = "failed"
 
+class EstimateKind(str, enum.Enum):
+    rent_long_term = "rent_long_term"
+    value = "value"
 
 # -----------------------------
 # Models
 # -----------------------------
+
 class Property(Base):
     __tablename__ = "properties"
     __table_args__ = (
@@ -118,8 +122,12 @@ class Lead(Base):
     source: Mapped[LeadSource] = mapped_column(Enum(LeadSource), index=True)
 
     source_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+    # Truthy inputs / enrichment outputs
     list_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     rent_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    arv_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)  # NEW
+    rehab_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)  # optional
 
     deal_score: Mapped[float] = mapped_column(Float, default=0.0)
     motivation_score: Mapped[float] = mapped_column(Float, default=0.0)
@@ -127,7 +135,6 @@ class Lead(Base):
 
     status: Mapped[LeadStatus] = mapped_column(Enum(LeadStatus), default=LeadStatus.new, index=True)
 
-    # Optional debug fields (your ingest tries setattr if present)
     score_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     explain_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -159,37 +166,60 @@ class Integration(Base):
     name: Mapped[str] = mapped_column(String(80))
     type: Mapped[IntegrationType] = mapped_column(Enum(IntegrationType))
 
-    # QUIET BY DEFAULT ✅
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    # typically contains {"url": "...", "headers": {...}}
     config_json: Mapped[str] = mapped_column(Text, default="{}")
-
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class OutboxEvent(Base):
+    """
+    Outbox pattern (reliable integration events).
+    IMPORTANT: fields must match integrations/services/outbox.py
+    """
     __tablename__ = "outbox_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    topic: Mapped[str] = mapped_column(String(120), index=True)
+
+    # what happened
+    event_type: Mapped[str] = mapped_column(String(120), index=True)
     payload_json: Mapped[str] = mapped_column(Text)
 
+    # delivery bookkeeping
     status: Mapped[OutboxStatus] = mapped_column(Enum(OutboxStatus), default=OutboxStatus.pending, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
 
-    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class EstimateCache(Base):
+    """
+    Hard cache for external enrichment calls.
+    Keyed by (property_id, kind).
+    """
+    __tablename__ = "estimate_cache"
+    __table_args__ = (UniqueConstraint("property_id", "kind", name="uq_estimate_cache_prop_kind"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    property_id: Mapped[int] = mapped_column(Integer, index=True)
+    kind: Mapped[EstimateKind] = mapped_column(Enum(EstimateKind), index=True)
+
+    value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source: Mapped[str] = mapped_column(String(40), default="unknown")
+
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+    raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class JobRun(Base):
-    """
-    Tracks job executions (refresh, dispatch, etc.)
-    app/services/jobruns.py imports this.
-    """
     __tablename__ = "job_runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -200,8 +230,6 @@ class JobRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    # store error stack or message
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # optional metadata: {"zips": [...], "max_price": ...}
     meta_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
