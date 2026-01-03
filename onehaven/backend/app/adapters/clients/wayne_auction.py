@@ -1,4 +1,4 @@
-# onehaven/backend/app/connectors/wayne_auction.py
+# onehaven/backend/app/adapters/clients/wayne_auction.py
 from __future__ import annotations
 
 import hashlib
@@ -14,8 +14,9 @@ import certifi
 import httpx
 from bs4 import BeautifulSoup
 
+from ..ingestion.base import RawLead
+
 from ...config import settings
-from .base import RawLead
 
 BASE = "https://waynecountytreasurermi.com/"
 BATCHES_URL = urljoin(BASE, "batches.html")

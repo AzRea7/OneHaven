@@ -1,18 +1,15 @@
-# tests/test_integrations_disable.py
 import json
 import pytest
-from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import async_session, engine
-from app.models import Base, Integration, IntegrationType
+from app.models import Integration, IntegrationType
+from app.integrations.services.disable import disable_integration
 
 
 @pytest.mark.asyncio
-async def test_integration_name_unique_soft_guard():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    async with async_session() as session:
+async def test_integration_name_unique_soft_guard(async_session_maker):
+    async with async_session_maker() as session:  # type: AsyncSession
         i1 = Integration(
             name="dup",
             type=IntegrationType.webhook,
@@ -22,8 +19,6 @@ async def test_integration_name_unique_soft_guard():
         session.add(i1)
         await session.commit()
 
-    async with async_session() as session:
-        # second insert with same name should fail if you applied DB unique constraint
         i2 = Integration(
             name="dup",
             type=IntegrationType.webhook,
@@ -31,22 +26,14 @@ async def test_integration_name_unique_soft_guard():
             config_json=json.dumps({"url": "https://example.com", "secret": "x"}),
         )
         session.add(i2)
-        failed = False
-        try:
-            await session.commit()
-        except Exception:
-            failed = True
-            await session.rollback()
 
-    assert failed is True
+        with pytest.raises(IntegrityError):
+            await session.commit()
 
 
 @pytest.mark.asyncio
-async def test_disable_integration_flag():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    async with async_session() as session:
+async def test_disable_integration_flag(async_session_maker):
+    async with async_session_maker() as session:  # type: AsyncSession
         i = Integration(
             name="toggle",
             type=IntegrationType.webhook,
@@ -56,13 +43,9 @@ async def test_disable_integration_flag():
         session.add(i)
         await session.commit()
 
-    async with async_session() as session:
-        row = (await session.execute(select(Integration).where(Integration.name == "toggle"))).scalars().first()
-        assert row is not None
-        row.enabled = False
+        await disable_integration(session, name="toggle")
         await session.commit()
 
-    async with async_session() as session:
-        row2 = (await session.execute(select(Integration).where(Integration.name == "toggle"))).scalars().first()
-        assert row2 is not None
-        assert row2.enabled is False
+        # refresh and verify
+        await session.refresh(i)
+        assert i.enabled is False

@@ -215,23 +215,18 @@ class EstimateCache(Base):
     property_id: Mapped[int] = mapped_column(Integer, index=True)
     kind: Mapped[EstimateKind] = mapped_column(Enum(EstimateKind), index=True)
 
+    # the numeric estimate (rent, value, etc.)
     value: Mapped[float | None] = mapped_column(Float, nullable=True)
     source: Mapped[str] = mapped_column(String(40), default="unknown")
 
-    # semantic timestamp (when the estimate is “as-of”)
+    # bookkeeping timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # when the estimate was produced (used for TTL freshness checks)
     estimated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
-    # operational timestamp (when we fetched/wrote it)
-    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-
     raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # your service code is passing this (per the failure)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
-
-
-
 
 class JobRun(Base):
     __tablename__ = "job_runs"
