@@ -29,7 +29,7 @@ from .integrations.jobs.dispatch import run_dispatch
 from .service_layer.use_cases.outcomes import add_outcome_event, update_lead_status
 from .service_layer.use_cases.metrics import conversion_by_bucket, time_to_contact_by_bucket, roi_vs_realized
 from .adapters.clients.wayne_auction import WayneAuctionConnector
-from .services.jobruns import start_job, finish_job_success, finish_job_fail
+from .service_layer.jobruns import start_job, finish_job_success, finish_job_fail
 
 app = FastAPI(title="OneHaven - Lead Truth Engine")
 

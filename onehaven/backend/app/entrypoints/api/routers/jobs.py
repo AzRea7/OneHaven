@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..deps import require_api_key
 from ....db import get_session
-from ....services.jobruns import start_job, finish_job_success, finish_job_fail
+from ....service_layer.jobruns import start_job, finish_job_success, finish_job_fail
 from ....schemas import DispatchResult
 from ....integrations.jobs.dispatch import run_dispatch
 from ....service_layer.use_cases.refresh import refresh_region_use_case

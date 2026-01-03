@@ -1,4 +1,4 @@
-from app.services.normalize import normalize_property_type, is_allowed_type
+from onehaven.backend.app.domain.normalize import normalize_property_type, is_allowed_type
 
 
 def test_property_type_normalization_and_filtering():

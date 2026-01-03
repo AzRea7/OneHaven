@@ -9,8 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ...config import settings
 from ...models import LeadSource, Strategy, EstimateKind
 from ...services.ingest import upsert_property, create_or_update_lead, score_lead
-from ...services.normalize import is_disallowed_type
-from ...services.estimates import get_or_fetch_estimate
+from ...domain.normalize import is_disallowed_type
+from ..estimates import get_or_fetch_estimate
 from ...adapters.clients.rentcast_avm import fetch_rent_long_term, fetch_value
 
 from ...adapters.ingestion.base import IngestionProvider, RawLead
