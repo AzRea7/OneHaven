@@ -1,12 +1,12 @@
 # app/main.py
 from __future__ import annotations
 import json
-from fastapi import FastAPI, Depends, Query, HTTPException, Header
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, func
 from collections import defaultdict
 import statistics
 from typing import Any
+from fastapi import FastAPI, Depends, Query, HTTPException, Header
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, desc, func
 
 
 from .config import settings
@@ -30,14 +30,49 @@ from .service_layer.use_cases.outcomes import add_outcome_event, update_lead_sta
 from .service_layer.use_cases.metrics import conversion_by_bucket, time_to_contact_by_bucket, roi_vs_realized
 from .adapters.clients.wayne_auction import WayneAuctionConnector
 from .service_layer.jobruns import start_job, finish_job_success, finish_job_fail
+from .service_layer.use_cases.outcomes import update_lead_status, add_outcome_event
+from .service_layer.estimates import snapshot_global_stats, reset_global_stats
 
-app = FastAPI(title="OneHaven - Lead Truth Engine")
+app = FastAPI(title="OneHaven API")
 
 
 def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
     if settings.API_KEY:
         if not x_api_key or x_api_key != settings.API_KEY:
             raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+    if settings.API_KEY and x_api_key != settings.API_KEY:
+        raise HTTPException(status_code=401, detail="invalid_api_key")
+
+
+@app.post("/jobs/refresh", dependencies=[Depends(require_api_key)])
+async def jobs_refresh(
+    zips: str = Query(..., description="Comma-separated ZIPs"),
+    max_price: float | None = Query(default=None),
+) -> JobResult:
+    zip_list = [z.strip() for z in zips.split(",") if z.strip()]
+    async with get_session() as session:
+        result = await refresh_region(session, zips=zip_list, max_price=max_price)
+        return result
+
+
+@app.get("/debug/estimates/stats", dependencies=[Depends(require_api_key)])
+def debug_estimates_stats(reset: bool = Query(default=False)) -> dict[str, Any]:
+    """
+    Process-lifetime counters to validate cache behavior:
+      - Run refresh once -> see misses/fetch_success rise
+      - Run refresh again -> see hits rise, misses/fetch_success much smaller
+    """
+    if reset:
+        reset_global_stats()
+    return {"estimate_cache": snapshot_global_stats()}
 
 
 @app.on_event("startup")

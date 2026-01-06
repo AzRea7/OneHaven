@@ -131,32 +131,42 @@ class Property(Base):
     # extra columns in your DB (fine to keep)
     owner_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     owner_mailing: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    owner_mailing_city: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    owner_mailing_state: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     last_sale_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_sale_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     # DB has created_at (NOT NULL). DB does NOT have updated_at.
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 class Lead(Base):
     __tablename__ = "leads"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    property_id: Mapped[int] = mapped_column(Integer, index=True)
-    strategy: Mapped[Strategy] = mapped_column(Enum(Strategy), index=True)
+    property_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    strategy: Mapped[str] = mapped_column(String, nullable=False, default=Strategy.rental.value)
 
     list_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    max_price_rule: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    rent_estimate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    arv_estimate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
-    score: Mapped[Optional[float]] = mapped_column(Float, nullable=True, index=True)
-    status: Mapped[LeadStatus] = mapped_column(Enum(LeadStatus), default=LeadStatus.new, index=True)
+    deal_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    motivation_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    rank_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
-    reasons_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    raw_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default=LeadStatus.new.value)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    source_ref: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    explain_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 class OutcomeEvent(Base):
@@ -174,19 +184,32 @@ class OutcomeEvent(Base):
     contract_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     realized_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+class Outcome(Base):
+    __tablename__ = "outcomes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lead_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    type: Mapped[str] = mapped_column(String, nullable=False)
+
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
 
 class Integration(Base):
     __tablename__ = "integrations"
-    __table_args__ = (UniqueConstraint("name", name="uq_integration_name"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(80))
-    type: Mapped[IntegrationType] = mapped_column(Enum(IntegrationType))
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    type: Mapped[str] = mapped_column(String, nullable=False, default=IntegrationType.webhook.value)
+    name: Mapped[str] = mapped_column(String, nullable=False)
 
-    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    config_json: Mapped[str] = mapped_column(Text, default="{}")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    endpoint: Mapped[str] = mapped_column(String, nullable=False)
+    secret: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 class OutboxEvent(Base):
     __tablename__ = "outbox_events"

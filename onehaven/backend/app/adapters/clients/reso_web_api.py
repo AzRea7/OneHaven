@@ -3,56 +3,46 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
-
 from ...config import settings
+from .http_resilience import resilient_request
 
 
 class ResoWebApiClient:
-    """
-    Minimal RESO Web API client.
-    Your real implementation can expand query building and auth.
-    """
+    """Minimal RESO Web API client (OData-ish)."""
 
-    def __init__(self) -> None:
-        self.base_url = (settings.RESO_BASE_URL or "").rstrip("/")
-        self.access_token = settings.RESO_ACCESS_TOKEN
+    def __init__(self, *, base_url: str | None = None, access_token: str | None = None) -> None:
+        self.base_url = ((base_url if base_url is not None else settings.RESO_BASE_URL) or "").rstrip("/")
+        self.access_token = access_token if access_token is not None else settings.RESO_ACCESS_TOKEN
 
     def _headers(self) -> dict[str, str]:
         if not self.access_token:
-            raise RuntimeError("RESO_ACCESS_TOKEN is not set")
-        return {"Authorization": f"Bearer {self.access_token}", "accept": "application/json"}
+            return {"accept": "application/json"}
+        return {"accept": "application/json", "authorization": f"Bearer {self.access_token}"}
 
-    async def query_listings(self, *, zipcode: str | None = None, city: str | None = None, top: int = 200) -> list[dict[str, Any]]:
-        """
-        Generic listings query.
-        NOTE: You must align the endpoint path and query with your provider (MLS Grid or your MLS).
-        """
+    async def search_property_listings(
+        self,
+        *,
+        zipcode: str,
+        max_price: float | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
         if not self.base_url:
-            raise RuntimeError("RESO_BASE_URL is not set")
+            return []
 
-        # Example RESO OData path (provider-specific)
         url = f"{self.base_url}/Property"
 
-        # Provider-specific OData $filter
-        filters: list[str] = []
-        if zipcode:
-            filters.append(f"PostalCode eq '{zipcode}'")
-        if city:
-            filters.append(f"City eq '{city}'")
+        filters: list[str] = [f"PostalCode eq '{zipcode}'"]
+        if max_price is not None:
+            filters.append(f"ListPrice le {float(max_price)}")
 
-        params: dict[str, Any] = {"$top": top}
-        if filters:
-            params["$filter"] = " and ".join(filters)
+        params: dict[str, Any] = {"$top": int(limit), "$filter": " and ".join(filters)}
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(url, headers=self._headers(), params=params)
-            r.raise_for_status()
-            data = r.json()
+        resp = await resilient_request("GET", url, headers=self._headers(), params=params)
+        data = resp.json()
 
-        # Typical OData: {"value":[...]}
-        if isinstance(data, dict) and isinstance(data.get("value"), list):
-            return data["value"]
+        items = data.get("value") if isinstance(data, dict) else None
+        if isinstance(items, list):
+            return [x for x in items if isinstance(x, dict)]
         if isinstance(data, list):
-            return data
+            return [x for x in data if isinstance(x, dict)]
         return []

@@ -10,7 +10,7 @@ from ...config import settings
 from ...models import LeadSource, Strategy, EstimateKind
 from ...domain.normalize import is_disallowed_type
 
-from ..estimates import get_or_fetch_estimate, EstimateResult
+from ..estimates import get_or_fetch_estimate, EstimateResult, EstimateStats
 from ..scoring import score_lead
 
 from ...adapters.repos.properties import PropertyRepository
@@ -20,6 +20,8 @@ from ...adapters.ingestion.base import IngestionProvider, RawLead
 from ...adapters.ingestion.rentcast_listings import RentCastListingsProvider
 from ...adapters.ingestion.mls_reso import MlsResoProvider
 from ...adapters.ingestion.mls_grid import MlsGridProvider
+from ...adapters.ingestion.realcomp_direct import RealcompDirectProvider
+
 
 SE_MICHIGAN_ZIPS = [
     "48009", "48084", "48301", "48067", "48306", "48304", "48302",
@@ -35,55 +37,38 @@ def _coerce_float(x: Any) -> float | None:
         return float(x)
     except Exception:
         return None
-    
 
-def _build_ingestion_provider():
+
+def _build_ingestion_provider() -> IngestionProvider:
     src = settings.INGESTION_SOURCE
 
     if src == "rentcast_listings":
         return RentCastListingsProvider.from_settings()
     if src == "mls_reso":
         return MlsResoProvider.from_settings()
-    if src == "mls_grid":  # NEW
+    if src == "mls_grid":
         return MlsGridProvider.from_settings()
+    if src == "realcomp_direct":
+        return RealcompDirectProvider.from_settings()
 
     raise ValueError(f"Unknown INGESTION_SOURCE={src}")
 
 
 def _missing_core_fields(payload: dict[str, Any]) -> bool:
-    # strict: canonical identity fields must exist
     return not all(payload.get(k) for k in ("addressLine", "city", "state", "zipCode"))
-
-
-def _provider() -> IngestionProvider:
-    """
-    Feature-flagged ingestion. The refresh pipeline does not care
-    whether listings come from RentCast, MLS RESO, or future sources.
-    """
-    if settings.INGESTION_SOURCE == "mls_reso":
-        return MlsResoProvider()
-    return RentCastListingsProvider()
 
 
 # -------------------------------------------------------------------
 # Module-level fetchers (IMPORTANT: tests monkeypatch these symbols)
 # -------------------------------------------------------------------
 async def fetch_value(prop) -> EstimateResult:
-    """
-    Fetch value estimate (AVM).
-    Tests will monkeypatch refresh_uc.fetch_value to force deterministic behavior.
-    """
-    from ...adapters.clients.rentcast_avm import fetch_value
-    return await fetch_value(prop)
+    from ...adapters.clients.rentcast_avm import fetch_value as _fetch_value
+    return await _fetch_value(prop)
 
 
 async def fetch_rent_long_term(prop) -> EstimateResult:
-    """
-    Fetch long-term rent estimate (AVM).
-    Tests will monkeypatch refresh_uc.fetch_rent_long_term to force deterministic behavior.
-    """
-    from ...adapters.clients.rentcast_avm import fetch_rent_long_term_avm
-    return await fetch_rent_long_term_avm(prop)
+    from ...adapters.clients.rentcast_avm import fetch_rent_long_term_avm as _fetch_rent
+    return await _fetch_rent(prop)
 
 
 async def refresh_region_use_case(
@@ -99,27 +84,25 @@ async def refresh_region_use_case(
     ttl_days_value: int = 60,
 ) -> dict[str, Any]:
     """
-    Canonical 3-phase refresh:
-      1) ingest   -> normalize -> upsert property + lead (sale truth only)
-      2) enrich   -> rent/value via EstimateCache (property anchored)
-      3) score    -> deterministic scoring; rentals hard-gated on rent
-
-    External APIs only happen in Phase 2.
+    End-to-end refresh:
+      1) INGEST (provider-specific)
+      2) ENRICH (EstimateCache: rent + value)
+      3) SCORE (enforce rental gating)
     """
     drop_reasons: dict[str, int] = defaultdict(int)
     target_zips = zips or SE_MICHIGAN_ZIPS
 
     created = updated = dropped = 0
-    provider = _provider()
+    provider = _build_ingestion_provider()
 
     prop_repo = PropertyRepository(session)
     lead_repo = LeadRepository(session)
 
+    ingested: list[tuple[Any, Any]] = []
+
     # -------------------------
     # Phase 1: INGEST
     # -------------------------
-    ingested: list[tuple[Any, Any]] = []
-
     raw_leads: list[RawLead] = await provider.fetch(
         region=region,
         zips=target_zips,
@@ -147,25 +130,18 @@ async def refresh_region_use_case(
             continue
 
         raw_type = payload.get("propertyType")
-        disallowed, norm_type, reason_key = is_disallowed_type(raw_type)
-        if disallowed:
+        if raw_type and is_disallowed_type(str(raw_type)):
             dropped += 1
-            drop_reasons["disallowed_type"] += 1
-            if reason_key:
-                drop_reasons[reason_key] += 1
-            if norm_type:
-                drop_reasons[f"norm_type::{norm_type}"] += 1
+            drop_reasons[f"raw_type::{raw_type}"] += 1
             continue
 
-        # Property identity anchor
         prop = await prop_repo.upsert_from_payload(payload)
 
-        # Lead is sale-truth only at ingest: enrichment owns rent/value
         lead, was_created = await lead_repo.upsert(
             prop=prop,
             strategy=strategy,
-            source=rl.source or LeadSource.rentcast_listing,
-            source_ref=rl.source_ref or None,
+            source=str(rl.source.value) if rl.source else None,
+            source_ref=rl.source_ref,
             list_price=lp,
             rent_estimate=None,
             provenance=payload,
@@ -178,13 +154,16 @@ async def refresh_region_use_case(
     # -------------------------
     # Phase 2: ENRICH (cached)
     # -------------------------
+    est_stats = EstimateStats()
+
     for lead, prop in ingested:
         value_row = await get_or_fetch_estimate(
             session,
             prop=prop,
             kind=EstimateKind.value,
             ttl_days=ttl_days_value,
-            fetcher=fetch_value,  # module-level symbol (monkeypatchable)
+            fetcher=fetch_value,
+            stats=est_stats,
         )
         if value_row.value is not None:
             lead.arv_estimate = float(value_row.value)
@@ -195,7 +174,8 @@ async def refresh_region_use_case(
                 prop=prop,
                 kind=EstimateKind.rent_long_term,
                 ttl_days=ttl_days_rent,
-                fetcher=fetch_rent_long_term,  # module-level symbol (monkeypatchable)
+                fetcher=fetch_rent_long_term,
+                stats=est_stats,
             )
             if rent_row.value is not None:
                 lead.rent_estimate = float(rent_row.value)
@@ -204,6 +184,7 @@ async def refresh_region_use_case(
     # Phase 3: SCORE (hard gate)
     # -------------------------
     for lead, prop in ingested:
+        # “no theater” rule
         if lead.strategy == Strategy.rental and lead.rent_estimate is None:
             drop_reasons["missing_rent_enrichment"] += 1
             lead.deal_score = 0.0
@@ -223,4 +204,5 @@ async def refresh_region_use_case(
         "strategy": strategy.value,
         "phases": {"ingested": len(ingested), "enriched": len(ingested), "scored": len(ingested)},
         "ingestion_source": settings.INGESTION_SOURCE,
+        "estimate_cache": est_stats.snapshot(),
     }

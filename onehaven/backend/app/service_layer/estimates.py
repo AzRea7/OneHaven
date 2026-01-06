@@ -21,6 +21,43 @@ class EstimateResult:
 Fetcher = Callable[[Property], Awaitable[EstimateResult]]
 
 
+@dataclass
+class EstimateStats:
+    """
+    Per-run counters (returned from refresh response)
+    """
+    hits: int = 0
+    misses: int = 0
+    fetch_success: int = 0
+    fetch_fail: int = 0
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "fetch_success": self.fetch_success,
+            "fetch_fail": self.fetch_fail,
+        }
+
+
+# Global counters for debug endpoint (process-lifetime, not persisted)
+_GLOBAL = {
+    "hits": 0,
+    "misses": 0,
+    "fetch_success": 0,
+    "fetch_fail": 0,
+}
+
+
+def snapshot_global_stats() -> dict[str, int]:
+    return dict(_GLOBAL)
+
+
+def reset_global_stats() -> None:
+    for k in list(_GLOBAL.keys()):
+        _GLOBAL[k] = 0
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -38,13 +75,14 @@ async def get_or_fetch_estimate(
     kind: EstimateKind,
     ttl_days: int,
     fetcher: Fetcher,
+    stats: EstimateStats | None = None,
 ) -> EstimateCache:
     """
     Return an EstimateCache row (always).
     If cached and fresh => return cached row.
     Else call fetcher(prop), write/update cache row, return it.
 
-    NOTE: We cache even "None" values to avoid repeated calls.
+    We cache even "None" values to avoid repeated calls for bad inputs.
     """
     q = select(EstimateCache).where(
         EstimateCache.property_id == prop.id,
@@ -53,9 +91,26 @@ async def get_or_fetch_estimate(
     row = (await session.execute(q)).scalars().first()
 
     if row and _is_fresh(row, ttl_days):
+        _GLOBAL["hits"] += 1
+        if stats:
+            stats.hits += 1
         return row
 
-    result = await fetcher(prop)
+    _GLOBAL["misses"] += 1
+    if stats:
+        stats.misses += 1
+
+    try:
+        result = await fetcher(prop)
+        _GLOBAL["fetch_success"] += 1
+        if stats:
+            stats.fetch_success += 1
+    except Exception:
+        _GLOBAL["fetch_fail"] += 1
+        if stats:
+            stats.fetch_fail += 1
+        # still write a cache row with None so we don’t hammer vendor endpoints
+        result = EstimateResult(value=None, source="error", raw=None)
 
     now = _utcnow()
     if row:
