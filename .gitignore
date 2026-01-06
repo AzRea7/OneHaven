@@ -3,5 +3,10 @@
 .env.example
 .egg-info
 *.txt
+data/
+*.db
 __pycache__/
+.pytest_cache/
+
 *.pyc
+haven.db

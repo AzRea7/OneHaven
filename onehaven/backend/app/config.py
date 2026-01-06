@@ -41,7 +41,15 @@ class Settings(BaseSettings):
     SCHED_DISPATCH_BATCH_SIZE: int = 50
 
     # --- Ingestion selection ---
-    INGESTION_SOURCE: str = "rentcast"  # rentcast | mls_reso
+    INGESTION_SOURCE: str = "rentcast_listings" 
+    MLS_PRIMARY_NAME: str = "unknown"
+
+    RESO_BASE_URL: str = ""
+    RESO_ACCESS_TOKEN: str = ""
+
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()

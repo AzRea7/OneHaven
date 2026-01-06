@@ -19,7 +19,7 @@ from ...adapters.repos.leads import LeadRepository
 from ...adapters.ingestion.base import IngestionProvider, RawLead
 from ...adapters.ingestion.rentcast_listings import RentCastListingsProvider
 from ...adapters.ingestion.mls_reso import MlsResoProvider
-
+from ...adapters.ingestion.mls_grid import MlsGridProvider
 
 SE_MICHIGAN_ZIPS = [
     "48009", "48084", "48301", "48067", "48306", "48304", "48302",
@@ -35,6 +35,19 @@ def _coerce_float(x: Any) -> float | None:
         return float(x)
     except Exception:
         return None
+    
+
+def _build_ingestion_provider():
+    src = settings.INGESTION_SOURCE
+
+    if src == "rentcast_listings":
+        return RentCastListingsProvider.from_settings()
+    if src == "mls_reso":
+        return MlsResoProvider.from_settings()
+    if src == "mls_grid":  # NEW
+        return MlsGridProvider.from_settings()
+
+    raise ValueError(f"Unknown INGESTION_SOURCE={src}")
 
 
 def _missing_core_fields(payload: dict[str, Any]) -> bool:

@@ -43,6 +43,7 @@ class LeadSource(str, PyEnum):
     wayne_auction = "wayne_auction"
     manual = "manual"
     mls_reso = "mls_reso"
+    mls_grid = "mls_grid"
 
 
 class Strategy(str, PyEnum):
