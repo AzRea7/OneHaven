@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,6 +39,14 @@ def _coerce_float(x: Any) -> float | None:
         return None
 
 
+def _first(payload: dict[str, Any], *keys: str) -> Any:
+    """Return the first non-empty payload value for any of the provided keys."""
+    for k in keys:
+        if k in payload and payload.get(k) not in (None, ""):
+            return payload.get(k)
+    return None
+
+
 def _build_ingestion_provider() -> IngestionProvider:
     src = settings.INGESTION_SOURCE
 
@@ -54,8 +62,21 @@ def _build_ingestion_provider() -> IngestionProvider:
     raise ValueError(f"Unknown INGESTION_SOURCE={src}")
 
 
+# -------------------------------------------------------------------
+# Provider factory (IMPORTANT: tests monkeypatch this symbol)
+# -------------------------------------------------------------------
+def _provider() -> IngestionProvider:
+    return _build_ingestion_provider()
+
+
 def _missing_core_fields(payload: dict[str, Any]) -> bool:
-    return not all(payload.get(k) for k in ("addressLine", "city", "state", "zipCode"))
+    # Accept either camelCase or snake_case
+    address = _first(payload, "addressLine", "address_line", "address_line1", "address")
+    city = _first(payload, "city")
+    state = _first(payload, "state")
+    zipc = _first(payload, "zipCode", "zipcode", "zip_code")
+
+    return not all([address, city, state, zipc])
 
 
 # -------------------------------------------------------------------
@@ -93,7 +114,7 @@ async def refresh_region_use_case(
     target_zips = zips or SE_MICHIGAN_ZIPS
 
     created = updated = dropped = 0
-    provider = _build_ingestion_provider()
+    provider = _provider()
 
     prop_repo = PropertyRepository(session)
     lead_repo = LeadRepository(session)
@@ -110,6 +131,9 @@ async def refresh_region_use_case(
         per_zip_limit=per_zip_limit,
     )
 
+    # keep your debug if you want; tests showed you were printing it
+    # print(f"DEBUG raw_leads: {len(raw_leads)} provider: {type(provider).__name__}")
+
     for rl in raw_leads:
         payload = rl.payload or {}
 
@@ -118,7 +142,8 @@ async def refresh_region_use_case(
             drop_reasons["missing_core"] += 1
             continue
 
-        lp = _coerce_float(payload.get("listPrice"))
+        # list price can be camelCase or snake_case
+        lp = _coerce_float(_first(payload, "listPrice", "list_price", "price"))
         if lp is None:
             dropped += 1
             drop_reasons["missing_price"] += 1
@@ -129,14 +154,16 @@ async def refresh_region_use_case(
             drop_reasons["over_max_price"] += 1
             continue
 
-        raw_type = payload.get("propertyType")
+        raw_type = _first(payload, "propertyType", "property_type", "type")
         if raw_type and is_disallowed_type(str(raw_type)):
             dropped += 1
             drop_reasons[f"raw_type::{raw_type}"] += 1
             continue
 
+        # upsert property
         prop = await prop_repo.upsert_from_payload(payload)
 
+        # upsert lead (repo swallows extra kwargs if schema differs)
         lead, was_created = await lead_repo.upsert(
             prop=prop,
             strategy=strategy,
@@ -147,8 +174,8 @@ async def refresh_region_use_case(
             provenance=payload,
         )
 
-        created += int(was_created)
-        updated += int(not was_created)
+        created += int(bool(was_created))
+        updated += int(not bool(was_created))
         ingested.append((lead, prop))
 
     # -------------------------
@@ -168,7 +195,7 @@ async def refresh_region_use_case(
         if value_row.value is not None:
             lead.arv_estimate = float(value_row.value)
 
-        if lead.strategy == Strategy.rental:
+        if lead.strategy == Strategy.rental or lead.strategy == Strategy.rental.value:
             rent_row = await get_or_fetch_estimate(
                 session,
                 prop=prop,
@@ -184,8 +211,10 @@ async def refresh_region_use_case(
     # Phase 3: SCORE (hard gate)
     # -------------------------
     for lead, prop in ingested:
+        is_rental = lead.strategy == Strategy.rental or lead.strategy == Strategy.rental.value
+
         # “no theater” rule
-        if lead.strategy == Strategy.rental and lead.rent_estimate is None:
+        if is_rental and lead.rent_estimate is None:
             drop_reasons["missing_rent_enrichment"] += 1
             lead.deal_score = 0.0
             lead.motivation_score = 0.0
@@ -201,7 +230,7 @@ async def refresh_region_use_case(
         "dropped": dropped,
         "drop_reasons": dict(drop_reasons),
         "target_zips": target_zips,
-        "strategy": strategy.value,
+        "strategy": strategy.value if hasattr(strategy, "value") else str(strategy),
         "phases": {"ingested": len(ingested), "enriched": len(ingested), "scored": len(ingested)},
         "ingestion_source": settings.INGESTION_SOURCE,
         "estimate_cache": est_stats.snapshot(),

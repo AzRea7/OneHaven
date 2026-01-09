@@ -6,6 +6,17 @@ from sqlalchemy.pool import StaticPool
 from app.models import Base  
 from app.models import Property
 
+import pytest_asyncio
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_db(engine):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
+
 @pytest.fixture(autouse=True)
 async def _reset_db(engine):
     async with engine.begin() as conn:

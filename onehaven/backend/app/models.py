@@ -15,7 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, synonym
 
 
 def utcnow() -> datetime:
@@ -44,6 +44,7 @@ class LeadSource(str, PyEnum):
     manual = "manual"
     mls_reso = "mls_reso"
     mls_grid = "mls_grid"
+    realcomp_direct = "realcomp_direct"  # <-- needed by RealcompDirectProvider
 
 
 class Strategy(str, PyEnum):
@@ -90,45 +91,45 @@ class Property(Base):
     """
     IMPORTANT: This model is mapped to your *current* SQLite schema.
 
-    Your DB table `properties` has columns:
+    Table `properties` contains (at least):
       address_line, city, state, zipcode, lat, lon, property_type, beds, baths, sqft,
       owner_name, owner_mailing, last_sale_date, last_sale_price, created_at,
       source, source_listing_id
 
-    So we keep the *Python attribute names* your code prefers (address_line1, zip_code, etc.)
-    but map them onto the existing column names using mapped_column("<db_column_name>", ...).
+    Your code + tests sometimes use:
+      address_line, zipcode, lat, lon, beds, baths
+    While your domain code prefers:
+      address_line1, zip_code, latitude, longitude, bedrooms, bathrooms
+
+    So we:
+      1) map canonical Python attrs to the real DB column names
+      2) add synonyms for the alternate names used in tests/callers
     """
     __tablename__ = "properties"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    # These two exist in DB (you confirmed via PRAGMA)
+    # Provider identity
     source: Mapped[str] = mapped_column(String, default="unknown", nullable=False)
     source_listing_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
-    # DB column is `address_line` (NOT NULL)
+    # Address
     address_line1: Mapped[str] = mapped_column("address_line", String(255), nullable=False)
-
-    # DB has no address_line2 column
     city: Mapped[str] = mapped_column(String(80), nullable=False)
     state: Mapped[str] = mapped_column(String(2), nullable=False)
-
-    # DB column is `zipcode` (NOT NULL)
     zip_code: Mapped[str] = mapped_column("zipcode", String(10), nullable=False)
 
-    # DB columns are `lat` / `lon`
+    # Geo
     latitude: Mapped[Optional[float]] = mapped_column("lat", Float, nullable=True)
     longitude: Mapped[Optional[float]] = mapped_column("lon", Float, nullable=True)
 
+    # Characteristics
     property_type: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
-
-    # DB columns are `beds` / `baths`
     bedrooms: Mapped[Optional[int]] = mapped_column("beds", Integer, nullable=True)
     bathrooms: Mapped[Optional[float]] = mapped_column("baths", Float, nullable=True)
-
     sqft: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
-    # extra columns in your DB (fine to keep)
+    # Extra columns (keep)
     owner_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     owner_mailing: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     owner_mailing_city: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -136,9 +137,28 @@ class Property(Base):
     last_sale_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_sale_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
-    # DB has created_at (NOT NULL). DB does NOT have updated_at.
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    # NOTE: your comment says DB doesn't have updated_at, but tests/code reference it.
+    # Keeping it mapped avoids surprises even if SQLite table has it or is created in tests.
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+    # -----------------------------
+    # Synonyms / aliases (CRITICAL for tests)
+    # -----------------------------
+    # address_line is used by some call sites
+    address_line = synonym("address_line1")
+
+    # tests/fixtures sometimes pass zipcode=... directly
+    zipcode = synonym("zip_code")
+
+    # tests/fixtures sometimes pass lat/lon=... directly
+    lat = synonym("latitude")
+    lon = synonym("longitude")
+
+    # common alternate field names
+    beds = synonym("bedrooms")
+    baths = synonym("bathrooms")
 
 
 class Lead(Base):
@@ -165,8 +185,10 @@ class Lead(Base):
 
     explain_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+    raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class OutcomeEvent(Base):
@@ -184,6 +206,7 @@ class OutcomeEvent(Base):
     contract_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     realized_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+
 class Outcome(Base):
     __tablename__ = "outcomes"
 
@@ -193,23 +216,23 @@ class Outcome(Base):
 
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class Integration(Base):
     __tablename__ = "integrations"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
     type: Mapped[str] = mapped_column(String, nullable=False, default=IntegrationType.webhook.value)
-    name: Mapped[str] = mapped_column(String, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False, unique=True)
 
-    endpoint: Mapped[str] = mapped_column(String, nullable=False)
-    secret: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    config_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
 
-    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 class OutboxEvent(Base):
     __tablename__ = "outbox_events"
@@ -233,11 +256,9 @@ class OutboxEvent(Base):
 
 class EstimateCache(Base):
     """
-    IMPORTANT: This model is mapped to your *current* SQLite schema.
-
     estimate_cache columns from PRAGMA:
-      id, property_id, kind, value, source, fetched_at (NOT NULL), expires_at (NOT NULL),
-      raw_json, created_at(TEXT default), updated_at(TEXT default), estimated_at
+      id, property_id, kind, value, source, fetched_at, expires_at, raw_json,
+      created_at(TEXT default), updated_at(TEXT default), estimated_at
     """
     __tablename__ = "estimate_cache"
     __table_args__ = (UniqueConstraint("property_id", "kind", name="uq_estimate_cache_prop_kind"),)
@@ -250,13 +271,16 @@ class EstimateCache(Base):
     value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     source: Mapped[str] = mapped_column(String(40), nullable=False, default="unknown")
 
-    # Required in DB
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
-    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=lambda: utcnow() + timedelta(days=1))
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=lambda: utcnow() + timedelta(days=1),
+    )
 
     raw_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # DB has these as TEXT defaults; we map them as strings to avoid sqlite/type weirdness
+    # SQLite defaults often store these as TEXT; keep as Optional[str] to avoid adapter weirdness
     created_at: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     updated_at: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

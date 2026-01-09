@@ -29,7 +29,7 @@ class PropertyRepository:
         """
 
         # Accept both snake_case and RentCast keys
-        address_line1 = (payload.get("address_line1") or payload.get("addressLine1") or payload.get("address_line") or "").strip()
+        address_line1 = (payload.get("address_line1") or payload.get("addressLine") or payload.get("addressLine1") or payload.get("address_line") or "").strip()
         city = (payload.get("city") or "").strip()
         state = (payload.get("state") or "").strip()
         zip_code = (payload.get("zip_code") or payload.get("zipCode") or payload.get("zipcode") or "").strip()
