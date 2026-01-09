@@ -10,6 +10,15 @@ class RentCastListingsProvider(IngestionProvider):
     def __init__(self) -> None:
         self._rc = RentCastConnector()
 
+    @classmethod
+    def from_settings(cls) -> "RentCastListingsProvider":
+        from ...config import settings
+        return cls(
+            api_key=settings.RENTCAST_API_KEY,
+            base_url=settings.RENTCAST_BASE_URL,
+        )
+
+
     async def fetch(
         self,
         *,

@@ -9,13 +9,10 @@ from ...config import settings
 from ...models import Property
 from ...service_layer.estimates import EstimateResult
 
+from ..ml_models.local_fallback import predict_local_value, predict_local_rent_long_term
+
 
 def _get_attr(obj: Any, *names: str) -> Any:
-    """
-    Robust attribute getter so we don't explode when the ORM/model evolves.
-
-    Example: Property used to have address_line/zipcode and now has address_line1/zip_code.
-    """
     for n in names:
         if hasattr(obj, n):
             v = getattr(obj, n)
@@ -25,7 +22,6 @@ def _get_attr(obj: Any, *names: str) -> Any:
 
 
 def _addr_string(prop: Property) -> str:
-    # Prefer the new names, but support old ones.
     address = _get_attr(prop, "address_line1", "address_line", "addressLine", "address")
     city = _get_attr(prop, "city")
     state = _get_attr(prop, "state")
@@ -51,18 +47,27 @@ def _coerce_float(x: Any) -> float | None:
 
 async def fetch_rent_long_term(prop: Property, comp_count: int = 5) -> EstimateResult:
     """
-    Calls RentCast long-term rent AVM.
-    Returns EstimateResult(value=<rent>, source="rentcast", raw=<json>)
+    Local model -> else vendor -> EstimateCache handled upstream.
+    value stored as p50; p10/p50/p90 stored in raw_json via EstimateCache.raw_json.
     """
+    # 1) Local first
+    try:
+        local = await predict_local_rent_long_term(prop)
+        if local.value is not None:
+            return local
+    except Exception as e:
+        # Don’t blow up pipeline; fall through to vendor
+        local = EstimateResult(value=None, source=f"local_model_error:{type(e).__name__}", raw=None)
+
+    # 2) Vendor next (only if key exists)
     if not settings.RENTCAST_API_KEY:
-        return EstimateResult(value=None, source="disabled", raw=None)
+        # Preserve local failure info if we have it
+        return local if local.source.startswith("local_model_error") else EstimateResult(value=None, source="disabled", raw=None)
 
     url = f"{settings.RENTCAST_BASE_URL.rstrip('/')}/avm/rent/long-term"
     headers = {"X-Api-Key": settings.RENTCAST_API_KEY, "accept": "application/json"}
-
     params: dict[str, Any] = {"compCount": comp_count}
 
-    # Priority: address; fallback: lat/lon if present
     addr = _addr_string(prop)
     if addr:
         params["address"] = addr
@@ -97,26 +102,31 @@ async def fetch_rent_long_term(prop: Property, comp_count: int = 5) -> EstimateR
     except Exception as e:
         return EstimateResult(value=None, source=f"rentcast_error:{type(e).__name__}", raw=None)
 
-    # RentCast usually returns "rent" for rent endpoints
     rent = data.get("rent") if isinstance(data, dict) else None
-    return EstimateResult(
-        value=_coerce_float(rent),
-        source="rentcast",
-        raw=data if isinstance(data, dict) else None,
-    )
+    rent_p50 = _coerce_float(rent)
+
+    # Optional: if vendor returns comps or ranges you can also map p10/p90 into raw here later
+    return EstimateResult(value=rent_p50, source="rentcast", raw=data if isinstance(data, dict) else None)
 
 
 async def fetch_value(prop: Property, comp_count: int = 5) -> EstimateResult:
     """
-    Calls RentCast value AVM.
-    Returns EstimateResult(value=<price>, source="rentcast", raw=<json>)
+    Local model -> else vendor -> EstimateCache handled upstream.
     """
+    # 1) Local first
+    try:
+        local = await predict_local_value(prop)
+        if local.value is not None:
+            return local
+    except Exception as e:
+        local = EstimateResult(value=None, source=f"local_model_error:{type(e).__name__}", raw=None)
+
+    # 2) Vendor next
     if not settings.RENTCAST_API_KEY:
-        return EstimateResult(value=None, source="disabled", raw=None)
+        return local if local.source.startswith("local_model_error") else EstimateResult(value=None, source="disabled", raw=None)
 
     url = f"{settings.RENTCAST_BASE_URL.rstrip('/')}/avm/value"
     headers = {"X-Api-Key": settings.RENTCAST_API_KEY, "accept": "application/json"}
-
     params: dict[str, Any] = {"compCount": comp_count}
 
     addr = _addr_string(prop)
@@ -154,22 +164,12 @@ async def fetch_value(prop: Property, comp_count: int = 5) -> EstimateResult:
         return EstimateResult(value=None, source=f"rentcast_error:{type(e).__name__}", raw=None)
 
     price = data.get("price") if isinstance(data, dict) else None
-    return EstimateResult(
-        value=_coerce_float(price),
-        source="rentcast",
-        raw=data if isinstance(data, dict) else None,
-    )
+    return EstimateResult(value=_coerce_float(price), source="rentcast", raw=data if isinstance(data, dict) else None)
 
 
-# -------------------------------------------------------------------
-# Backwards-compatible exports (your refresh use case imports these)
-# -------------------------------------------------------------------
-
+# Back-compat exports (your refresh use case imports these)
 async def fetch_rent_long_term_avm(prop: Property, comp_count: int = 5) -> EstimateResult:
-    # Legacy name used elsewhere in the codebase
     return await fetch_rent_long_term(prop, comp_count=comp_count)
 
-
 async def fetch_value_avm(prop: Property, comp_count: int = 5) -> EstimateResult:
-    # Legacy name used elsewhere in the codebase
     return await fetch_value(prop, comp_count=comp_count)

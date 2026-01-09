@@ -5,7 +5,7 @@ from fastapi import FastAPI
 
 from ..db import engine
 from ..models import Base
-from .api.routers import health, jobs, leads, integrations, outcomes, metrics
+from .api.routers import health, jobs, leads, integrations, outcomes, metrics, debug
 
 
 def create_app() -> FastAPI:
@@ -24,5 +24,6 @@ def create_app() -> FastAPI:
     app.include_router(integrations.router)
     app.include_router(outcomes.router)
     app.include_router(metrics.router)
-
+    app.include_router(debug.router)
+    
     return app
