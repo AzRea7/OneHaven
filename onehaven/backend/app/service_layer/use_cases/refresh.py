@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,14 +39,6 @@ def _coerce_float(x: Any) -> float | None:
         return None
 
 
-def _first(payload: dict[str, Any], *keys: str) -> Any:
-    """Return the first non-empty payload value for any of the provided keys."""
-    for k in keys:
-        if k in payload and payload.get(k) not in (None, ""):
-            return payload.get(k)
-    return None
-
-
 def _build_ingestion_provider() -> IngestionProvider:
     src = settings.INGESTION_SOURCE
 
@@ -62,21 +54,15 @@ def _build_ingestion_provider() -> IngestionProvider:
     raise ValueError(f"Unknown INGESTION_SOURCE={src}")
 
 
+def _missing_core_fields(payload: dict[str, Any]) -> bool:
+    return not all(payload.get(k) for k in ("addressLine", "city", "state", "zipCode"))
+
+
 # -------------------------------------------------------------------
-# Provider factory (IMPORTANT: tests monkeypatch this symbol)
+# Provider indirection (IMPORTANT: tests monkeypatch this symbol)
 # -------------------------------------------------------------------
 def _provider() -> IngestionProvider:
     return _build_ingestion_provider()
-
-
-def _missing_core_fields(payload: dict[str, Any]) -> bool:
-    # Accept either camelCase or snake_case
-    address = _first(payload, "addressLine", "address_line", "address_line1", "address")
-    city = _first(payload, "city")
-    state = _first(payload, "state")
-    zipc = _first(payload, "zipCode", "zipcode", "zip_code")
-
-    return not all([address, city, state, zipc])
 
 
 # -------------------------------------------------------------------
@@ -90,6 +76,27 @@ async def fetch_value(prop) -> EstimateResult:
 async def fetch_rent_long_term(prop) -> EstimateResult:
     from ...adapters.clients.rentcast_avm import fetch_rent_long_term_avm as _fetch_rent
     return await _fetch_rent(prop)
+
+
+def _eval_disallowed_property_type(raw_type: Any) -> tuple[bool, str | None, str | None]:
+    """
+    Compatibility wrapper because is_disallowed_type used to return bool, and now returns a tuple:
+      (disallowed: bool, norm_type: str|None, reason_key: str|None)
+
+    Returns: (disallowed, norm_type, reason_key)
+    """
+    if raw_type is None:
+        return (False, None, None)
+
+    res = is_disallowed_type(str(raw_type))
+
+    # New contract: tuple
+    if isinstance(res, tuple) and len(res) == 3:
+        disallowed, norm_type, reason_key = res
+        return (bool(disallowed), norm_type, reason_key)
+
+    # Old contract: bool
+    return (bool(res), None, None)
 
 
 async def refresh_region_use_case(
@@ -131,9 +138,6 @@ async def refresh_region_use_case(
         per_zip_limit=per_zip_limit,
     )
 
-    # keep your debug if you want; tests showed you were printing it
-    # print(f"DEBUG raw_leads: {len(raw_leads)} provider: {type(provider).__name__}")
-
     for rl in raw_leads:
         payload = rl.payload or {}
 
@@ -142,8 +146,7 @@ async def refresh_region_use_case(
             drop_reasons["missing_core"] += 1
             continue
 
-        # list price can be camelCase or snake_case
-        lp = _coerce_float(_first(payload, "listPrice", "list_price", "price"))
+        lp = _coerce_float(payload.get("listPrice"))
         if lp is None:
             dropped += 1
             drop_reasons["missing_price"] += 1
@@ -154,16 +157,22 @@ async def refresh_region_use_case(
             drop_reasons["over_max_price"] += 1
             continue
 
-        raw_type = _first(payload, "propertyType", "property_type", "type")
-        if raw_type and is_disallowed_type(str(raw_type)):
+        raw_type = payload.get("propertyType")
+        disallowed, norm_type, reason_key = _eval_disallowed_property_type(raw_type)
+        if disallowed:
             dropped += 1
-            drop_reasons[f"raw_type::{raw_type}"] += 1
+            # Prefer the reason_key from normalize (it’s designed for drop_reasons counters)
+            drop_reasons[reason_key or f"raw_type::{raw_type}"] += 1
             continue
 
-        # upsert property
+        # Optional: if normalize produced a stable normalized type, persist it through ingestion
+        # without destroying the original payload structure too much.
+        if norm_type:
+            payload = dict(payload)
+            payload["propertyTypeNorm"] = norm_type
+
         prop = await prop_repo.upsert_from_payload(payload)
 
-        # upsert lead (repo swallows extra kwargs if schema differs)
         lead, was_created = await lead_repo.upsert(
             prop=prop,
             strategy=strategy,
@@ -174,8 +183,8 @@ async def refresh_region_use_case(
             provenance=payload,
         )
 
-        created += int(bool(was_created))
-        updated += int(not bool(was_created))
+        created += int(was_created)
+        updated += int(not was_created)
         ingested.append((lead, prop))
 
     # -------------------------
@@ -195,7 +204,7 @@ async def refresh_region_use_case(
         if value_row.value is not None:
             lead.arv_estimate = float(value_row.value)
 
-        if lead.strategy == Strategy.rental or lead.strategy == Strategy.rental.value:
+        if lead.strategy == Strategy.rental:
             rent_row = await get_or_fetch_estimate(
                 session,
                 prop=prop,
@@ -211,10 +220,8 @@ async def refresh_region_use_case(
     # Phase 3: SCORE (hard gate)
     # -------------------------
     for lead, prop in ingested:
-        is_rental = lead.strategy == Strategy.rental or lead.strategy == Strategy.rental.value
-
         # “no theater” rule
-        if is_rental and lead.rent_estimate is None:
+        if lead.strategy == Strategy.rental and lead.rent_estimate is None:
             drop_reasons["missing_rent_enrichment"] += 1
             lead.deal_score = 0.0
             lead.motivation_score = 0.0
@@ -230,7 +237,7 @@ async def refresh_region_use_case(
         "dropped": dropped,
         "drop_reasons": dict(drop_reasons),
         "target_zips": target_zips,
-        "strategy": strategy.value if hasattr(strategy, "value") else str(strategy),
+        "strategy": strategy.value,
         "phases": {"ingested": len(ingested), "enriched": len(ingested), "scored": len(ingested)},
         "ingestion_source": settings.INGESTION_SOURCE,
         "estimate_cache": est_stats.snapshot(),
