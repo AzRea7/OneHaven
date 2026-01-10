@@ -17,7 +17,6 @@ from ...adapters.repos.properties import PropertyRepository
 from ...adapters.repos.leads import LeadRepository
 
 from ...adapters.ingestion.base import IngestionProvider, RawLead
-from ...adapters.ingestion.rentcast_listings import RentCastListingsProvider
 from ...adapters.ingestion.mls_reso import MlsResoProvider
 from ...adapters.ingestion.mls_grid import MlsGridProvider
 from ...adapters.ingestion.realcomp_direct import RealcompDirectProvider
@@ -42,8 +41,13 @@ def _coerce_float(x: Any) -> float | None:
 def _build_ingestion_provider() -> IngestionProvider:
     src = settings.INGESTION_SOURCE
 
+    # RentCast is intentionally not assumed available.
     if src == "rentcast_listings":
-        return RentCastListingsProvider.from_settings()
+        raise ValueError(
+            "INGESTION_SOURCE=rentcast_listings is disabled in this setup (no RentCast access). "
+            "Use INGESTION_SOURCE=realcomp_direct (recommended), mls_reso, or mls_grid."
+        )
+
     if src == "mls_reso":
         return MlsResoProvider.from_settings()
     if src == "mls_grid":
@@ -66,36 +70,77 @@ def _provider() -> IngestionProvider:
 
 
 # -------------------------------------------------------------------
-# Module-level fetchers (IMPORTANT: tests monkeypatch these symbols)
+# A) Local model fallback -> else vendor -> cache percentiles
 # -------------------------------------------------------------------
 async def fetch_value(prop) -> EstimateResult:
-    from ...adapters.clients.rentcast_avm import fetch_value as _fetch_value
-    return await _fetch_value(prop)
+    # 1) local model first (pure adapter)
+    from ...adapters.ml_models.local_fallback import predict_local_value
+
+    local = await predict_local_value(prop)
+    # local.raw already contains p10/p50/p90; we also pass them into EstimateResult fields
+    if local.value is not None and isinstance(local.raw, dict):
+        return EstimateResult(
+            value=local.value,
+            source=local.source,
+            raw=local.raw,
+            p10=local.raw.get("p10"),
+            p50=local.raw.get("p50"),
+            p90=local.raw.get("p90"),
+        )
+
+    # 2) optional vendor fallback (only if configured)
+    if settings.RENTCAST_API_KEY:
+        from ...adapters.clients.rentcast_avm import fetch_value as vendor_fetch_value
+
+        v = await vendor_fetch_value(prop)
+        # vendor may not have percentiles; store value as p50
+        return EstimateResult(value=v.value, source=v.source, raw=v.raw, p50=v.value)
+
+    # 3) no vendor configured
+    return EstimateResult(
+        value=None,
+        source="local_model:no_signal",
+        raw=local.raw,
+    )
 
 
 async def fetch_rent_long_term(prop) -> EstimateResult:
-    from ...adapters.clients.rentcast_avm import fetch_rent_long_term_avm as _fetch_rent
-    return await _fetch_rent(prop)
+    from ...adapters.ml_models.local_fallback import predict_local_rent_long_term
+
+    local = await predict_local_rent_long_term(prop)
+    if local.value is not None and isinstance(local.raw, dict):
+        return EstimateResult(
+            value=local.value,
+            source=local.source,
+            raw=local.raw,
+            p10=local.raw.get("p10"),
+            p50=local.raw.get("p50"),
+            p90=local.raw.get("p90"),
+        )
+
+    if settings.RENTCAST_API_KEY:
+        from ...adapters.clients.rentcast_avm import fetch_rent_long_term_avm as vendor_fetch_rent
+
+        v = await vendor_fetch_rent(prop)
+        return EstimateResult(value=v.value, source=v.source, raw=v.raw, p50=v.value)
+
+    return EstimateResult(
+        value=None,
+        source="local_model:no_signal",
+        raw=local.raw,
+    )
 
 
 def _eval_disallowed_property_type(raw_type: Any) -> tuple[bool, str | None, str | None]:
-    """
-    Compatibility wrapper because is_disallowed_type used to return bool, and now returns a tuple:
-      (disallowed: bool, norm_type: str|None, reason_key: str|None)
-
-    Returns: (disallowed, norm_type, reason_key)
-    """
     if raw_type is None:
         return (False, None, None)
 
     res = is_disallowed_type(str(raw_type))
 
-    # New contract: tuple
     if isinstance(res, tuple) and len(res) == 3:
         disallowed, norm_type, reason_key = res
         return (bool(disallowed), norm_type, reason_key)
 
-    # Old contract: bool
     return (bool(res), None, None)
 
 
@@ -111,12 +156,6 @@ async def refresh_region_use_case(
     ttl_days_rent: int = 45,
     ttl_days_value: int = 60,
 ) -> dict[str, Any]:
-    """
-    End-to-end refresh:
-      1) INGEST (provider-specific)
-      2) ENRICH (EstimateCache: rent + value)
-      3) SCORE (enforce rental gating)
-    """
     drop_reasons: dict[str, int] = defaultdict(int)
     target_zips = zips or SE_MICHIGAN_ZIPS
 
@@ -161,38 +200,37 @@ async def refresh_region_use_case(
         disallowed, norm_type, reason_key = _eval_disallowed_property_type(raw_type)
         if disallowed:
             dropped += 1
-            # Prefer the reason_key from normalize (it’s designed for drop_reasons counters)
-            drop_reasons[reason_key or f"raw_type::{raw_type}"] += 1
+            # keep both raw + normalized reason keys for analysis
+            if raw_type is not None:
+                drop_reasons[f"raw_type::{raw_type}"] += 1
+            if norm_type is not None:
+                drop_reasons[f"norm_type::{norm_type}"] += 1
+            if reason_key:
+                drop_reasons[reason_key] += 1
             continue
 
-        # Optional: if normalize produced a stable normalized type, persist it through ingestion
-        # without destroying the original payload structure too much.
-        if norm_type:
-            payload = dict(payload)
-            payload["propertyTypeNorm"] = norm_type
+        prop, was_created = await prop_repo.upsert_from_payload(payload)
+        if was_created:
+            created += 1
+        else:
+            updated += 1
 
-        prop = await prop_repo.upsert_from_payload(payload)
-
-        lead, was_created = await lead_repo.upsert(
-            prop=prop,
-            strategy=strategy,
-            source=str(rl.source.value) if rl.source else None,
-            source_ref=rl.source_ref,
-            list_price=lp,
-            rent_estimate=None,
-            provenance=payload,
-        )
-
-        created += int(was_created)
-        updated += int(not was_created)
-        ingested.append((lead, prop))
+        ingested.append((prop, rl))
 
     # -------------------------
-    # Phase 2: ENRICH (cached)
+    # Phase 2: ENRICH (cache)
     # -------------------------
     est_stats = EstimateStats()
 
-    for lead, prop in ingested:
+    for prop, rl in ingested:
+        rent_row = await get_or_fetch_estimate(
+            session,
+            prop=prop,
+            kind=EstimateKind.rent_long_term,
+            ttl_days=ttl_days_rent,
+            fetcher=fetch_rent_long_term,
+            stats=est_stats,
+        )
         value_row = await get_or_fetch_estimate(
             session,
             prop=prop,
@@ -201,35 +239,19 @@ async def refresh_region_use_case(
             fetcher=fetch_value,
             stats=est_stats,
         )
-        if value_row.value is not None:
-            lead.arv_estimate = float(value_row.value)
 
-        if lead.strategy == Strategy.rental:
-            rent_row = await get_or_fetch_estimate(
-                session,
-                prop=prop,
-                kind=EstimateKind.rent_long_term,
-                ttl_days=ttl_days_rent,
-                fetcher=fetch_rent_long_term,
-                stats=est_stats,
-            )
-            if rent_row.value is not None:
-                lead.rent_estimate = float(rent_row.value)
+        # -------------------------
+        # Phase 3: SCORE
+        # -------------------------
+        score = score_lead(prop=prop, rent=rento(rent_row), value=valueo(value_row), strategy=strategy)
 
-    # -------------------------
-    # Phase 3: SCORE (hard gate)
-    # -------------------------
-    for lead, prop in ingested:
-        # “no theater” rule
-        if lead.strategy == Strategy.rental and lead.rent_estimate is None:
-            drop_reasons["missing_rent_enrichment"] += 1
-            lead.deal_score = 0.0
-            lead.motivation_score = 0.0
-            lead.rank_score = 0.0
-            lead.explain_json = "blocked: missing rent_estimate (rental strategy)"
-            continue
-
-        await score_lead(session, lead, prop, is_auction=False)
+        await lead_repo.upsert_lead(
+            property_id=prop.id,
+            strategy=strategy,
+            source=LeadSource.realcomp if settings.INGESTION_SOURCE == "realcomp_direct" else LeadSource.mls,
+            lead_score=score.rank_score,
+            reasons=score.reasons,
+        )
 
     return {
         "created_leads": created,
@@ -237,8 +259,14 @@ async def refresh_region_use_case(
         "dropped": dropped,
         "drop_reasons": dict(drop_reasons),
         "target_zips": target_zips,
-        "strategy": strategy.value,
-        "phases": {"ingested": len(ingested), "enriched": len(ingested), "scored": len(ingested)},
-        "ingestion_source": settings.INGESTION_SOURCE,
         "estimate_cache": est_stats.snapshot(),
     }
+
+
+def rento(row):
+    # helper: tolerate missing value/p50
+    return getattr(row, "p50", None) if getattr(row, "p50", None) is not None else getattr(row, "value", None)
+
+
+def valueo(row):
+    return getattr(row, "p50", None) if getattr(row, "p50", None) is not None else getattr(row, "value", None)
