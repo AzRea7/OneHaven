@@ -16,9 +16,8 @@ def _get_db_url() -> str:
     """
     Canonical DB URL resolution.
 
-    Your repo uses HAVEN_DB_URL (confirmed). Support additional names to prevent future drift:
-      - DB_URI
-      - DATABASE_URL
+    Repo uses HAVEN_DB_URL. We also support DB_URI / DATABASE_URL to prevent future drift
+    (and make Docker/CI configs easier).
 
     Order:
       1) settings.HAVEN_DB_URL (current)
@@ -49,6 +48,7 @@ def _sqlite_path_from_uri(db_uri: str) -> str | None:
 
 
 def _apply_sqlite_pragmas(db_path: str) -> None:
+    # Helps a lot with “SQLite is fragile” in async apps
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
@@ -62,6 +62,7 @@ def _apply_sqlite_pragmas(db_path: str) -> None:
 
 
 def _run_sqlite_migrations(db_path: str) -> None:
+    # Idempotent “good enough migrations” while you’re still on SQLite
     from scripts.migrate_sqlite import main as migrate_main
 
     migrate_main(db_path)
@@ -92,7 +93,7 @@ async def async_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
-# ✅ Compatibility: your existing FastAPI deps import get_session
+# ✅ Compatibility: FastAPI deps import get_session
 async def get_session() -> AsyncIterator[AsyncSession]:
     async with async_session_maker() as session:
         yield session

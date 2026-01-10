@@ -5,40 +5,38 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
+    # Core
     ENV: str = "dev"
+    API_KEY: str = "change-me"
+
+    # DB (canonical)
     HAVEN_DB_URL: str = "sqlite+aiosqlite:///./haven.db"
 
-    API_KEY: str | None = None
+    # Ingestion provider switch
+    # dev-safe default so vendor downtime doesn't break local iteration
+    INGESTION_SOURCE: str = "stub_json"
 
-    # rentcast_listings | mls_reso | mls_grid | realcomp_direct
-    # Default to realcomp_direct because RentCast is not assumed available.
-    INGESTION_SOURCE: str = "realcomp_direct"
-
-    MLS_PRIMARY_NAME: str = "realcomp"
-
-    # RentCast (optional; leave blank if you don’t have access)
-    RENTCAST_BASE_URL: str = "https://api.rentcast.io"
-    RENTCAST_API_KEY: str = ""
-
-    # Generic RESO Web API (token already acquired)
-    RESO_BASE_URL: str = ""
-    RESO_ACCESS_TOKEN: str = ""
+    # RESO / MLS (generic)
+    RESO_BASE_URL: str | None = None
+    RESO_ACCESS_TOKEN: str | None = None
 
     # Direct Realcomp (OAuth2 -> RESO Web API)
-    REALCOMP_RESO_BASE_URL: str = ""      # e.g. https://<host>/reso/odata
-    REALCOMP_TOKEN_URL: str = ""          # e.g. https://<host>/oauth/token
-    REALCOMP_CLIENT_ID: str = ""
-    REALCOMP_CLIENT_SECRET: str = ""
-    REALCOMP_SCOPE: str = ""              # optional
+    REALCOMP_RESO_BASE_URL: str | None = None
+    REALCOMP_TOKEN_URL: str | None = None
+    REALCOMP_CLIENT_ID: str | None = None
+    REALCOMP_CLIENT_SECRET: str | None = None
+    REALCOMP_SCOPE: str | None = ""
 
-    HTTP_TIMEOUT_S: float = 20.0
-    HTTP_MAX_RETRIES: int = 3
-    HTTP_BACKOFF_BASE_S: float = 0.35
-    HTTP_RATE_LIMIT_RPS: float = 8.0
-    HTTP_CIRCUIT_FAIL_THRESHOLD: int = 8
-    HTTP_CIRCUIT_RESET_S: float = 30.0
+    # RentCast (kept for modularity, but you will disable usage in the provider builder)
+    RENTCAST_BASE_URL: str | None = "https://api.rentcast.io/v1"
+    RENTCAST_API_KEY: str | None = None
+
+    # Local ML models (A)
+    LOCAL_MODEL_DIR: str = "./models"
+    MODEL_VERSION: str = "local_v0"
+
+    # Pydantic settings
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 settings = Settings()

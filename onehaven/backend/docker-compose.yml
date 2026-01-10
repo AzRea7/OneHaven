@@ -1,11 +1,36 @@
 version: "3.9"
 
 services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: haven
+      POSTGRES_PASSWORD: haven
+      POSTGRES_DB: haven
+    ports:
+      - "5432:5432"
+    volumes:
+      - haven_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U haven -d haven"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   api:
     build: .
     ports:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      # override for docker-compose runs (you can still override in .env if you want)
+      HAVEN_DB_URL: postgresql+asyncpg://haven:haven@postgres:5432/haven
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - ./:/app
+
+volumes:
+  haven_pgdata:
