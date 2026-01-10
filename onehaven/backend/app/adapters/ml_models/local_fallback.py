@@ -46,30 +46,18 @@ class Percentiles:
 
 
 def _bands(p50: float, *, spread: float) -> Percentiles:
-    """
-    spread = fractional uncertainty around p50.
-    Example: spread=0.15 => p10=0.85*p50, p90=1.15*p50
-    """
     p10 = max(0.0, p50 * (1.0 - spread))
     p90 = max(0.0, p50 * (1.0 + spread))
     return Percentiles(p10=p10, p50=p50, p90=p90)
 
 
 def _local_value_heuristic(prop: Property) -> tuple[float | None, dict[str, Any]]:
-    """
-    Returns (p50_value or None, debug_features)
-    This is intentionally a simple baseline you can improve later
-    (e.g., replace with a real trained local model).
-    """
-    # Things we might have
     last_sale_price = _coerce_float(_get_attr(prop, "last_sale_price", "lastSalePrice"))
     sqft = _coerce_int(_get_attr(prop, "sqft", "square_footage", "squareFootage"))
     beds = _coerce_int(_get_attr(prop, "beds", "bedrooms"))
     baths = _coerce_float(_get_attr(prop, "baths", "bathrooms"))
 
-    # Simple “ppsf” prior if sqft exists.
-    # You can later load zip-level priors from a local file or DB table.
-    DEFAULT_PPSF = 165.0  # placeholder baseline for SE MI; tune later
+    DEFAULT_PPSF = 165.0  # baseline placeholder; tune later
 
     features: dict[str, Any] = {
         "last_sale_price": last_sale_price,
@@ -80,17 +68,13 @@ def _local_value_heuristic(prop: Property) -> tuple[float | None, dict[str, Any]
         "rule": None,
     }
 
-    # Rule 1: use last sale price as anchor if present
     if last_sale_price and last_sale_price > 0:
-        # modest appreciation anchor (very conservative)
         p50 = last_sale_price * 1.08
         features["rule"] = "anchor:last_sale_price*1.08"
         return p50, features
 
-    # Rule 2: sqft-based estimate if sqft exists
     if sqft and sqft > 0:
         ppsf = DEFAULT_PPSF
-        # very small adjustments
         if beds and beds >= 4:
             ppsf *= 1.03
         if baths and baths >= 2.5:
@@ -105,10 +89,6 @@ def _local_value_heuristic(prop: Property) -> tuple[float | None, dict[str, Any]
 
 
 def _local_rent_heuristic(prop: Property, *, value_p50: float | None) -> tuple[float | None, dict[str, Any]]:
-    """
-    Rent heuristic: if we have value, convert via a GRM-like baseline.
-    Otherwise, fallback to beds-based baseline.
-    """
     beds = _coerce_int(_get_attr(prop, "beds", "bedrooms"))
     sqft = _coerce_int(_get_attr(prop, "sqft", "square_footage", "squareFootage"))
 
@@ -120,12 +100,9 @@ def _local_rent_heuristic(prop: Property, *, value_p50: float | None) -> tuple[f
         "grm": None,
     }
 
-    # Rule 1: convert value->rent using a rough GRM baseline
-    # GRM 120 => annual rent ~ value/120 => monthly ~ value/1440
     if value_p50 and value_p50 > 0:
         grm = 120.0
         monthly = float(value_p50) / (grm * 12.0)
-        # small bump if larger house
         if sqft and sqft >= 2000:
             monthly *= 1.05
         if beds and beds >= 4:
@@ -134,7 +111,6 @@ def _local_rent_heuristic(prop: Property, *, value_p50: float | None) -> tuple[f
         features["rule"] = "anchor:value/grm/12"
         return max(0.0, monthly), features
 
-    # Rule 2: beds-only fallback (very rough)
     if beds and beds > 0:
         base = 950.0 + (beds - 2) * 275.0
         features["rule"] = "anchor:beds_baseline"
@@ -148,14 +124,21 @@ async def predict_local_value(prop: Property) -> EstimateResult:
     if p50 is None:
         return EstimateResult(value=None, source="local_model:no_signal", raw={"features": feats})
 
-    # value is noisier → wider uncertainty band
     pct = _bands(float(p50), spread=0.18)
     raw = {"kind": "value", "method": "heuristic_v1", **pct.as_dict(), "features": feats}
-    return EstimateResult(value=pct.p50, source="local_model", raw=raw)
+
+    # ✅ return percentiles explicitly
+    return EstimateResult(
+        value=pct.p50,
+        source="local_model",
+        raw=raw,
+        p10=pct.p10,
+        p50=pct.p50,
+        p90=pct.p90,
+    )
 
 
 async def predict_local_rent_long_term(prop: Property) -> EstimateResult:
-    # Use local value as helper signal (but don’t force it)
     value_est = await predict_local_value(prop)
     value_p50 = value_est.value
 
@@ -163,7 +146,14 @@ async def predict_local_rent_long_term(prop: Property) -> EstimateResult:
     if p50 is None:
         return EstimateResult(value=None, source="local_model:no_signal", raw={"features": feats})
 
-    # rent is a bit tighter than value
     pct = _bands(float(p50), spread=0.14)
     raw = {"kind": "rent_long_term", "method": "heuristic_v1", **pct.as_dict(), "features": feats}
-    return EstimateResult(value=pct.p50, source="local_model", raw=raw)
+
+    return EstimateResult(
+        value=pct.p50,
+        source="local_model",
+        raw=raw,
+        p10=pct.p10,
+        p50=pct.p50,
+        p90=pct.p90,
+    )

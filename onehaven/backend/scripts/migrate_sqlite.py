@@ -24,14 +24,12 @@ def add_column(conn, table: str, col: str, ddl_type: str) -> None:
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl_type};")
 
 
-def main() -> None:
-    conn = sqlite3.connect(DB)
+def main(db_path: str = DB) -> None:
+    conn = sqlite3.connect(db_path)
     try:
         # -------------------------
         # job_runs (schema drift)
         # -------------------------
-        # Model expects: meta_json, summary_json, error
-        # Existing DB may have: detail, meta_json, summary_json (no error)
         if has_table(conn, "job_runs"):
             if not has_column(conn, "job_runs", "meta_json"):
                 add_column(conn, "job_runs", "meta_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -45,7 +43,6 @@ def main() -> None:
         # -------------------------
         # estimate_cache (A: percentiles)
         # -------------------------
-        # We store p10/p50/p90 in columns, keep value as a compatibility alias for p50.
         if has_table(conn, "estimate_cache"):
             if not has_column(conn, "estimate_cache", "p10"):
                 add_column(conn, "estimate_cache", "p10", "REAL")
@@ -54,19 +51,15 @@ def main() -> None:
             if not has_column(conn, "estimate_cache", "p90"):
                 add_column(conn, "estimate_cache", "p90", "REAL")
 
-            # Some older schemas might not have estimated_at used by service_layer/estimates.py
             if not has_column(conn, "estimate_cache", "estimated_at"):
                 add_column(conn, "estimate_cache", "estimated_at", "DATETIME")
 
-            # Keep these if your code references them elsewhere; harmless if unused.
             if not has_column(conn, "estimate_cache", "created_at"):
                 add_column(conn, "estimate_cache", "created_at", "TEXT")
             if not has_column(conn, "estimate_cache", "updated_at"):
                 add_column(conn, "estimate_cache", "updated_at", "TEXT")
 
-        # -------------------------
-        # leads (example drift from earlier work)
-        # -------------------------
+        # Example drift (keep if your code references it)
         if has_table(conn, "leads"):
             if not has_column(conn, "leads", "rehab_estimate"):
                 add_column(conn, "leads", "rehab_estimate", "REAL")

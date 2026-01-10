@@ -39,11 +39,15 @@ class LeadStatus(str, PyEnum):
 
 
 class LeadSource(str, PyEnum):
+    # Existing
     rentcast_listing = "rentcast_listing"
     wayne_auction = "wayne_auction"
     manual = "manual"
     mls_reso = "mls_reso"
     mls_grid = "mls_grid"
+
+    # ✅ Add: direct Realcomp ingestion path
+    realcomp_direct = "realcomp_direct"
 
 
 class Strategy(str, PyEnum):
@@ -123,18 +127,11 @@ class Property(Base):
     last_sale_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
-
-    # Tests create tables from metadata, so this is fine there.
-    # If prod DB lacks this column, you’ll need a migration for prod runs.
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
-    # -------------------------
-    # Synonyms (critical for tests + older call sites)
-    # -------------------------
+    # Synonyms for older call sites
     address_line = synonym("address_line1")
     zipcode = synonym("zip_code")
-
-    # ✅ allow Property(lat=..., lon=...) in tests/fixtures
     lat = synonym("latitude")
     lon = synonym("longitude")
     beds = synonym("bedrooms")
@@ -165,6 +162,7 @@ class Lead(Base):
     source_ref: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     explain_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reasons_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     raw_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
@@ -185,18 +183,6 @@ class OutcomeEvent(Base):
 
     contract_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     realized_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
-
-
-class Outcome(Base):
-    __tablename__ = "outcomes"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    lead_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    type: Mapped[str] = mapped_column(String, nullable=False)
-
-    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class Integration(Base):
@@ -243,7 +229,14 @@ class EstimateCache(Base):
     property_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     kind: Mapped[EstimateKind] = mapped_column(Enum(EstimateKind), nullable=False, index=True)
 
+    # Compatibility: `value` continues to be the “main number” (treat as p50)
     value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # ✅ New: explicit percentiles for A)
+    p10: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    p50: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    p90: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     source: Mapped[str] = mapped_column(String(40), nullable=False, default="unknown")
 
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
@@ -267,6 +260,9 @@ class JobRun(Base):
 
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Your DB already has detail in some versions; keep it.
+    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     meta_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     summary_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
